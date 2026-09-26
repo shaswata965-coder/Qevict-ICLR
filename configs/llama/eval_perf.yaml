@@ -1,0 +1,74 @@
+# ============================================================================
+# Perf -- latency factorial: FullKV vs the windowed cache at three budgets, batch 1
+# (Meta-Llama-3-8B-Instruct).
+#
+# Records TTFT, decode step 0 (where the prompt is compacted), steady-state
+# TPOT, throughput and per-phase peak memory for every (config, grid cell).
+# Which throughput to quote is documented at the top of
+# modules/evaluation/perf_runner.py: decode = batch / tpot_steady,
+# end-to-end = batch * gen_len / e2e_latency.
+#   python main.py --config configs/llama/eval_perf.yaml
+#   python scripts/print_perf_table.py --npz-dir outputs
+# Each config row may override window_size / num_sink_tokens /
+# local_window_size / cache_budget / quant_ratio / quant_gate_ratio.
+# ============================================================================
+_base_: ../base.yaml
+
+run:
+  mode: perf
+  seed: 42
+
+model:
+  name: meta-llama/Meta-Llama-3-8B-Instruct
+  revision: main
+  dtype: float16
+
+window:
+  window_size: 32
+  num_sink_tokens: 4
+  local_window_size: 256
+
+perf:
+  configs:
+    - name: baseline_flash_attn
+      cache_backend: dynamic
+      attn_implementation: flash_attention_2
+      requires_flash_attn: true
+    - name: windowed_flash_50pct
+      cache_backend: windowed
+      cache_package: flash_attn
+      attn_implementation: flash_attention_2
+      cache_budget: 0.50
+      requires_flash_attn: true
+    - name: windowed_flash_25pct
+      cache_backend: windowed
+      cache_package: flash_attn
+      attn_implementation: flash_attention_2
+      cache_budget: 0.25
+      requires_flash_attn: true
+    - name: windowed_flash_10pct
+      cache_backend: windowed
+      cache_package: flash_attn
+      attn_implementation: flash_attention_2
+      cache_budget: 0.10
+      requires_flash_attn: true
+
+  grid:                                       # gen_len - 1 decode steps per cell
+    - { prefill_len: 4096, gen_len: 1024 }
+    - { prefill_len: 4096, gen_len: 4096 }
+    - { prefill_len: 8192, gen_len: 1024 }
+    - { prefill_len: 8192, gen_len: 4096 }
+
+  prefill_logits: last_only                   # drop the method-independent [B, L, V] prefill logits
+  num_warmup_runs: 2
+  warmup_decode_steps: null                   # null: warm up past the first eviction
+  num_measurement_runs: 10
+  cooldown_s: 3.0                             # idle between runs so the GPU does not throttle
+  enable_clock_locking: true
+  clock_settle_s: 5.0
+  allow_shared_gpu: false
+  skip_if_oom: true
+  skip_if_flash_attn_unavailable: true
+
+telemetry:
+  output_dir: outputs

@@ -1,0 +1,39 @@
+# ============================================================================
+# Tier study -- seven observation metrics (M1-M7) over five parity runs.
+# No model load. Writes outputs/tier_study/.
+#
+#   R0  parity_base, window_size 1   full-KV ground truth
+#   R1  parity_ours, ws 1,  q = 0.0  evict-only, token-level reference
+#   R2  parity_ours, ws 8,  q = 0.0  evict-only
+#   R3  parity_ours, ws 8,  q > 0    three-tier (fp16 / int2 / evicted)
+#   R4  parity_ours, ws 32, q > 0    three-tier, coarser windows
+#
+# Each ours run is teacher-forced from a base run with the SAME window_size, so
+# record one base run per window size and point r0_npz at the ws=1 one.
+# scripts/run_tier_study_local.py records all of them and runs this.
+#   python main.py --config configs/llama/eval_tier_study.yaml
+# ============================================================================
+_base_: ../base.yaml
+
+run:
+  mode: tier_study
+  seed: 42
+
+tier_study:
+  r0_npz: outputs/parity_base_ws1_wikitext-103.npz
+  r1_npz: outputs/parity_ours_ws1_evictonly_wikitext-103.npz
+  r2_npz: outputs/parity_ours_ws8_evictonly_wikitext-103.npz
+  r3_npz: outputs/parity_ours_ws8_threetier_wikitext-103.npz
+  r4_npz: outputs/parity_ours_ws32_threetier_wikitext-103.npz
+  fmm_horizon: 32
+  sticky_primary: false
+  trace_axis: sample_layer
+  per_head: true
+  layer_stride: 1
+  head_stride: 1
+  max_samples: null
+  confidence: 0.95
+  bootstrap_samples: 2000
+
+telemetry:
+  output_dir: outputs

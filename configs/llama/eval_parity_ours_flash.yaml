@@ -1,0 +1,56 @@
+# ============================================================================
+# Parity -- ours, flash_attn backend (Meta-Llama-3-8B-Instruct, windowed cache)
+#
+# Teacher-forced on the base run's tokens (base_run_npz) so every step is
+# compared against FullKV at the same position. Budget 0.25, window 32, fp16
+# tier only (quant_ratio 0.0); set cache.quant_ratio > 0 for the two-tier cache.
+# Run eval_parity_base.yaml first.
+#   python main.py --config configs/llama/eval_parity_ours_flash.yaml
+# ============================================================================
+_base_: ../base.yaml
+
+run:
+  mode: parity_ours
+  seed: 42
+
+base_run_npz: outputs/parity_base_wikitext-103.npz
+output_path: outputs/parity_ours_flash_wikitext-103.npz
+
+model:
+  name: meta-llama/Meta-Llama-3-8B-Instruct
+  revision: main
+  dtype: float16
+  attn_implementation: flash_attention_2      # must match cache.backend_package
+
+cache:
+  backend: windowed
+  backend_package: flash_attn
+  cache_budget: 0.25
+  window_size: 32
+  num_sink_tokens: 4
+  local_window_size: 256
+  quant_ratio: 0.0
+  quant_budget_mode: bytes
+
+data:
+  dataset: wikitext-103
+  article_id: 0
+  prefill_len: 2048
+  gen_len: 1024
+
+parity:
+  dataset: wikitext-103
+  num_articles: 50
+  article_index: 0
+  min_article_tokens: 4096
+  prefill_len: 2048
+  gen_len: 1024
+
+window:
+  window_size: 32
+  num_sink_tokens: 4
+  local_window_size: 256
+
+telemetry:
+  track_scores: true
+  output_dir: outputs

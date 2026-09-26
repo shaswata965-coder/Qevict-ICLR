@@ -1,0 +1,39 @@
+# ============================================================================
+# RecoverKV -- shared defaults.
+#
+# Every config under configs/<model>/ inherits this file (`_base_: ../base.yaml`)
+# and overrides only what differs. The full schema, with every field and its
+# default, is the dataclasses in utils/config.py.
+# ============================================================================
+
+run:
+  mode: parity_base                    # which suite runs; see main.py for the list
+  seed: 42
+
+model:
+  name: meta-llama/Meta-Llama-3-8B     # HF hub id or local checkpoint directory
+  revision: null                       # pin a specific HF revision for reproducibility
+  dtype: float16
+  attn_implementation: flash_attention_2
+
+cache:
+  backend: dynamic                     # dynamic (FullKV, transformers DynamicCache) | windowed (RecoverKV)
+  backend_package: null                # flash_attn (with attn_implementation flash_attention_2); null for FullKV
+  cache_budget: null                   # fraction of the context kept, in (0, 1]; null = FullKV
+  window_size: 8                       # tokens per eviction window (multiple of 4 when quant_ratio > 0)
+  num_sink_tokens: 4                   # leading tokens kept in fp16, never evicted
+  local_window_size: 0.25              # most recent tokens kept in fp16: int (multiple of window_size) or ratio
+  quant_ratio: 0.0                     # share of the evictable budget held in the int2 tier; 0 = fp16 tier only
+
+data:
+  dataset: wikitext-103                # wikitext-103 | pg19
+  article_id: 0
+  prefill_len: 100                     # used only when max_tokens is null
+  gen_len: 50                          # used only when max_tokens is null
+  num_samples: 1                       # parity runners: how many articles
+  max_tokens: null                     # total tokens per article; when set, split via `ratio`
+  ratio: 1.0                           # prefill fraction of max_tokens
+
+telemetry:
+  track_scores: false                  # per-step score traces; parity runs only
+  output_dir: outputs

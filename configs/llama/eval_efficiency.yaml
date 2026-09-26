@@ -1,0 +1,100 @@
+# ============================================================================
+# Perf -- efficiency under the published prompt-compression protocol
+# (Meta-Llama-3-8B-Instruct, bfloat16, batch 1)
+#
+# Only this project's cache is measured; no third-party method is imported.
+# The measurement CONDITIONS follow evaluation/efficiency_evaluate.py of the
+# DefensiveKV release (a kvpress fork):
+#   prompt          a sentence tiled to exactly context_length (repeat_sentence)
+#   context         24k / 32k / 40k tokens
+#   budget          a ratio of the prompt (budget_basis: context), 0.5
+#   decode steps    100 (gen_len 101: the prefill emits the first token)
+#   rounds          5 warmup, 10 measured
+# Timing uses perf_counter with a CUDA synchronize on both sides, and peak
+# memory is reset per round.
+#
+# Reading it against a press-style method (which compacts inside the prefill):
+# compare our prefill_plus_compress_ms (TTFT + decode step 0, where we compact)
+# with their prefill_latency, and tpot_steady_ms with their decoding_latency.
+# scripts/print_efficiency.py prints exactly that pairing. peak_decode_steady_mb
+# is the compressed-cache footprint; the whole-run peak is the prompt's.
+#
+# Another method can be measured on the same harness with a row
+#   cache_backend: external, method_factory: "pkg.module:build", compaction: prefill
+# (see resolve_method_factory in modules/evaluation/perf_runner.py).
+#   python main.py --config configs/llama/eval_efficiency.yaml
+#   python scripts/print_efficiency.py --npz-dir outputs/efficiency
+# ============================================================================
+_base_: ../base.yaml
+
+run:
+  mode: perf
+  seed: 42
+
+model:
+  name: meta-llama/Meta-Llama-3-8B-Instruct
+  revision: main
+  dtype: bfloat16
+
+window:
+  window_size: 8
+  num_sink_tokens: 5
+  local_window_size: 64
+
+cache:
+  first_eviction_step: 0
+  quant_budget_mode: bytes
+
+perf:
+  protocol: standard
+  prompt_mode: repeat_sentence
+  repeat_sentence: "The quick brown fox jumps over the lazy dog."
+  budget_basis: context
+  prefill_logits: last_only
+  warmup_decode_steps: null
+  cooldown_s: 3.0
+  enable_clock_locking: true
+  clock_settle_s: 5.0
+
+  configs:
+    - name: fullkv
+      cache_backend: dynamic
+      attn_implementation: flash_attention_2
+      requires_flash_attn: true
+    - name: ours_b50
+      cache_backend: windowed
+      cache_package: flash_attn
+      attn_implementation: flash_attention_2
+      cache_budget: 0.50
+      quant_ratio: 0.0
+      requires_flash_attn: true
+    - name: ours_b50_q50
+      cache_backend: windowed
+      cache_package: flash_attn
+      attn_implementation: flash_attention_2
+      cache_budget: 0.50
+      quant_ratio: 0.5
+      requires_flash_attn: true
+    - name: ours_b50_q50_gate1.0              # control: the gate opens every int2 window
+      cache_backend: windowed
+      cache_package: flash_attn
+      attn_implementation: flash_attention_2
+      cache_budget: 0.50
+      quant_ratio: 0.5
+      quant_gate_ratio: 1.0
+      requires_flash_attn: true
+
+  grid:
+    - { prefill_len: 24576, gen_len: 101, batch_size: 1 }
+    - { prefill_len: 32768, gen_len: 101, batch_size: 1 }
+    - { prefill_len: 40960, gen_len: 101, batch_size: 1 }
+
+  num_warmup_runs: 5
+  num_measurement_runs: 10
+  allow_shared_gpu: true
+  skip_if_oom: true
+  skip_if_flash_attn_unavailable: true
+
+telemetry:
+  track_scores: false
+  output_dir: outputs/efficiency

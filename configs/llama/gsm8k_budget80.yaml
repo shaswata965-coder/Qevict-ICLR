@@ -1,0 +1,51 @@
+# ============================================================================
+# GSM8K (8-shot chain-of-thought) -- windowed cache at an 80% budget
+# (Llama-3.1-8B-Instruct).
+#
+# NOTE: this arm runs the fp16-only cache (quant_ratio 0.0: no int2 tier, no
+# read gate) with 4 sink tokens and a 25% local window -- it is NOT the
+# operating point of gsm8k_budget20.yaml with a larger budget. To run the
+# operating point at 80%, override:
+#   --override cache.quant_ratio=0.70 cache.num_sink_tokens=5 cache.local_window_size=128
+#   python main.py --config configs/llama/gsm8k_budget80.yaml
+# ============================================================================
+_base_: ../base.yaml
+
+run:
+  mode: gsm8k
+  seed: 42
+
+model:
+  name: meta-llama/Llama-3.1-8B-Instruct
+  revision: main
+  dtype: float16
+  attn_implementation: flash_attention_2     # must match cache.backend_package
+
+cache:
+  backend: windowed
+  backend_package: flash_attn
+  cache_budget: 0.80
+  window_size: 8
+  num_sink_tokens: 4
+  local_window_size: 0.25
+  quant_ratio: 0.0
+  quant_budget_mode: bytes
+  first_eviction_step: 0
+
+window:
+  window_size: 8
+  num_sink_tokens: 4
+  local_window_size: 0.25
+
+telemetry:
+  track_scores: false
+
+gsm8k:
+  data_dir: data/gsm8k_cot
+  output_dir: outputs/gsm8k/budget80
+  results_dir: outputs/gsm8k
+  num_samples: max
+  shard: 0
+  num_shards: 1
+  skip_oom: false
+  aggressive_cache_clear: false

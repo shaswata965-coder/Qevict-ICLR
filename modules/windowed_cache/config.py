@@ -1,0 +1,726 @@
+"""WindowedCacheConfig and ResolvedConfig — typed, validated cache configuration.
+
+``WindowedCacheConfig`` is the user-facing configuration dataclass.
+``ResolvedConfig`` is the resolved (frozen) form with concrete integer counts
+derived from byte-based budget accounting.
+"""
+
+from __future__ import annotations
+
+import math
+import warnings
+from dataclasses import dataclass
+from typing import Any, Optional, Union
+
+import torch
+
+from .policy import FIRST_EVICTION_STEP
+
+#: Floor on `ResolvedConfig.budget_utilisation`. A budget that is granted and
+#: not spent is a quality result reported at the wrong operating point, so under
+#: 'bytes' this is enforced rather than reported.
+MIN_BUDGET_UTILISATION = 0.99
+
+
+# ---------------------------------------------------------------------------
+# ResolvedConfig (frozen, output of resolve())
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ResolvedConfig:
+    """Resolved cache configuration with concrete integer counts.
+
+    Produced by :meth:`WindowedCacheConfig.resolve`.  All fields are ints
+    (or the original ``window_size`` / ``num_sink_tokens``).
+    """
+
+    window_size: int
+    num_sink_tokens: int
+    local_tokens: int          # resolved post percentage-rounding
+    top_k_windows: int         # may be 0 (legal — sink + local only)
+    bytes_per_token: int
+    total_budget_bytes: int
+    total_budget_tokens: int
+    rerotate_on_evict: bool = False
+    # Decode step at which the FIRST eviction fires, independent of window_size
+    # (EvictionPolicy.should_evict). Default 0 = compress the prompt on the first
+    # decode step. Carried verbatim from WindowedCacheConfig.
+    first_eviction_step: int = FIRST_EVICTION_STEP
+    # --- two-tier quantization ---
+    # quant_ratio q splits the EVICTABLE window budget between the fp16 (K) tier
+    # and the int2 (Q) tier by memory. q=0 disables the Q tier entirely and every
+    # field below reduces to today's single-tier config (top_k_fp == top_k_windows,
+    # N_q == 0), so the pure-fp16 path stays byte-identical.
+    quant_ratio: float = 0.0
+    top_k_fp: int = -1         # evictable fp windows; sentinel -1 → top_k_windows
+    N_q: int = 0               # evictable int2 windows (0 when q=0)
+    # What `quant_ratio` divides. See WindowedCacheConfig.quant_budget_mode.
+    quant_budget_mode: str = "bytes"
+    # Bytes one retained window costs in each tier, as resolve() computed them.
+    # Carried so the memory claim is derivable from the resolved config alone.
+    # Which of the two axes `quant_ratio` moves depends on quant_budget_mode —
+    # the window count under 'bytes', the bytes under 'tokens' — so a report
+    # that cannot price a window cannot state the compression the method
+    # actually achieved under either.
+    bytes_per_fp_window: int = 0
+    bytes_per_q_window: int = 0
+    # The card's share of `bytes_per_q_window`, carried so a memory report can
+    # say what the gate costs without re-deriving it. Zero when there is no gate.
+    bytes_per_gate_card: int = 0
+    # None → decide from the batch size at the first forward (on at B=1, off
+    # above). See WindowedCacheConfig.quant_memoize_read.
+    quant_memoize_read: Optional[bool] = None
+    # Rank-1 read gate (modules/quant/sketch.py). This field is already RESOLVED
+    # -- `resolve()` has turned the tri-state knob into a bool, so readers here
+    # never re-derive it. `quant_gate_ratio` is the fraction of each step's
+    # active Q windows that get dequantized; the per-step cap is derived from it
+    # against the live `n_active`, not pinned to an integer, because `N_q` moves
+    # with the shape and a fixed count would not be the same fraction anywhere.
+    quant_sketch_enabled: bool = False
+    quant_gate_ratio: float = 0.25
+    quant_gate_margin: float = float("inf")
+    quant_gate_max_windows: Optional[int] = None
+
+    @property
+    def retained_evictable_bytes(self) -> int:
+        """Bytes the retained evictable windows cost across both tiers."""
+        return (self.top_k_fp * self.bytes_per_fp_window
+                + self.N_q * self.bytes_per_q_window)
+
+    @property
+    def evictable_budget_bytes(self) -> int:
+        """Bytes the SAME window count would cost at fp16 (the q=0 reference).
+
+        ``retained_evictable_bytes / evictable_budget_bytes`` is the compression
+        quantization actually bought at this operating point — 1.0 at q=0, and
+        falling with q under either mode.
+        """
+        return self.retained_windows * self.bytes_per_fp_window
+
+    @property
+    def retained_windows(self) -> int:
+        """Evictable windows kept across both tiers. ``quant_ratio``-invariant
+        under ``quant_budget_mode='tokens'``; growing as
+        ``top_k_windows * (1 + (b_fp/b_q - 1) * q)`` under ``'bytes'``."""
+        return self.top_k_fp + self.N_q
+
+    @property
+    def retained_bytes(self) -> int:
+        """Bytes the whole retained cache costs: sink + local (fp16) + both tiers."""
+        fixed = (self.num_sink_tokens + self.local_tokens) * self.bytes_per_token
+        return fixed + self.retained_evictable_bytes
+
+    @property
+    def budget_utilisation(self) -> float:
+        """``retained_bytes / total_budget_bytes`` — is the budget actually spent?
+
+        ~1.0 under ``quant_budget_mode='bytes'`` at every ``quant_ratio``: the
+        two tiers divide the byte allowance and each buys windows at its own
+        price, so the cache costs what it was granted.
+
+        Under ``'tokens'`` the window count is held fixed while the keys get
+        cheaper, so this FALLS with q — 0.63 at q=0.5, 0.48 at q=0.7 — and a run
+        reported at ``cache_budget=0.20`` is really holding 13.8% / 11.4% of the
+        full cache. That gap is a silent accuracy cost, so it is a property
+        rather than something each reader recomputes. Report it with every
+        quality row; the design notes is why.
+        """
+        if self.total_budget_bytes <= 0:
+            return 0.0
+        return self.retained_bytes / self.total_budget_bytes
+
+    @property
+    def retained_evictable_tokens(self) -> int:
+        """Keys one decode step attends over from the evictable band."""
+        return self.retained_windows * self.window_size
+
+    @property
+    def retained_tokens(self) -> int:
+        """Total keys retained: sink + both evictable tiers + local."""
+        return (self.num_sink_tokens + self.retained_evictable_tokens
+                + self.local_tokens)
+
+    def __post_init__(self) -> None:
+        # top_k_fp defaults to top_k_windows so direct constructions (and every
+        # q=0 path) mirror the single-tier count without extra plumbing.
+        if self.top_k_fp < 0:
+            object.__setattr__(self, "top_k_fp", self.top_k_windows)
+
+
+# ---------------------------------------------------------------------------
+# WindowedCacheConfig (user-facing)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class WindowedCacheConfig:
+    """User-facing configuration for the windowed KV cache.
+
+    Parameters
+    ----------
+    window_size : int
+        Size of each scoring window in tokens.  Must be > 0.
+    num_sink_tokens : int
+        Number of sink tokens always retained at the start.  Must be >= 0.
+    local_window_size : int | float
+        If int: number of local tokens (must be a multiple of *window_size*).
+        If float: ratio in (0, 1] of the **cache budget** (not the full
+        context) -- ``local ~= ratio * total_budget_tokens``, ``ceil`` then
+        snap up to the nearest *window_size* multiple.  Guarantees the local
+        region can never exceed the cache budget.
+    cache_budget : float
+        Fraction of full-cache memory to retain, in (0, 1].
+        Must be ``float`` — ``int`` and ``bool`` are rejected with clear errors.
+    track_scores : bool
+        Enable telemetry recording.  Default ``False``.
+    rerotate_on_evict : bool
+        If ``True``, re-rotate surviving keys to contiguous positions after
+        each eviction (StreamingLLM-style).  **Default ``False``.**  Re-rotation
+        is only correct if the model also rebases the query's RoPE position to
+        the compacted cache length every step; HuggingFace ``generate``
+        (transformers <= 4.47) advances ``cache_position`` monotonically
+        instead, so re-rotating keys while the query keeps its original absolute
+        position corrupts RoPE phase after the first eviction.  Leaving this off
+        keeps original key positions (KVPress / H2O behaviour), correct on any
+        version.
+    quant_ratio : float
+        Two-tier split ``q`` in ``[0, 1]``.  **Default 0.0** —
+        the Q (int2) tier is disabled and the cache is byte-identical to the
+        single-tier fp16 path.  When ``q > 0``, the evictable window budget is
+        split by memory: ``(1-q)`` to the fp16 tier, ``q`` to the int2 tier.
+        int2 halves the codes vs int4, but the fp16 scale/zero grid is fixed
+        overhead, so the honest gain is ~3.9× the windows per fp byte at
+        ``window_size = 8`` (see ``resolve``'s ``b_q``), not the naive 8×.
+        Requires a ``window_size`` divisible by 4 (int2 crumb packing).
+    quant_memoize_read : bool, optional
+        Cache the dequantized + RoPE'd Q tier between evictions, per layer.
+        **Default ``None`` = auto: on at ``B == 1``, off above.**
+
+        The memo is free at ``B == 1`` and pure waste of batch capacity above it.
+        At ``B == 1`` decode is weight-bound — every weight is read once per step
+        (16.06 GB for Llama-3.1-8B fp16, a 10.3 ms/token floor on an A100) and
+        that floor is independent of KV size — so the memo's footprint costs
+        nothing and it saves 7 of every 8 steps' dequant at ``window_size = 8``.
+
+        At ``B > 1`` it is charged **per row**, and batch capacity is the whole
+        thesis: batching is the only thing that amortizes the weight read, and
+        ``B`` is capped by KV memory, which is exactly what this method
+        compresses. Measured at the qasper steady state (``T_fp=565``,
+        ``T_q=1136``, 32 layers, ``H_kv=8``, ``D=128``, fp16) the memo holds
+        ~4.65 MB/layer/row ⇒ **~149 MB/row**, against ~125 MB/row for the actual
+        two-tier KV — it more than doubles per-row memory and cuts max-``B`` from
+        ~458 to ~204.
+
+        Set ``True`` to force it on at ``B > 1``: it trades that batch capacity
+        for ~8x fewer Q-tier dequants per step (the Phase-1 read path
+        rematerializes the whole tier every step without it, which the fused
+        kernel is what actually fixes). Which side wins at max-``B``
+        is a measurement the perf suite must make; the default is set by the
+        memory bound, which is the one we can compute.
+    quant_ratio : float
+        (see above)
+
+    Notes
+    -----
+    Scoring is H2O-style cumulative: every query row contributes to the
+    per-key score at every step.  There is no observation window.
+    """
+
+    window_size: int
+    num_sink_tokens: int
+    local_window_size: Union[int, float]
+    cache_budget: float
+    track_scores: bool = False
+    rerotate_on_evict: bool = False
+    quant_ratio: float = 0.0
+    # What `quant_ratio` divides between the fp16 and int2 tiers.
+    #
+    # "bytes" (default) — q splits the BYTE budget; each tier then buys windows
+    #     at its own price. An int2 window costs ~2.8x less than an fp16 one
+    #     with its gate card (b_fp/b_q = 32768/9632 at ws=8, D=128, H_kv=8; 5.1x
+    #     without the card), so the retained window count grows with q:
+    #
+    #       retained_windows = top_k_windows * (1 + (b_fp/b_q - 1) * q)
+    #
+    #     The BYTES retained are exactly `cache_budget` of the full cache at
+    #     every q — 19.9% of full-cache bytes at cache_budget=0.20 whether q is
+    #     0.0, 0.5 or 0.7 — which is what makes this the mode a memory-vs-quality
+    #     claim is stated in. Cheaper keys buying more context is the entire
+    #     point of the Q tier, and this is the mode that lets them.
+    #
+    # "tokens" — q splits the retained WINDOW COUNT instead, so both tiers
+    #     together always retain `top_k_windows` evictable windows and the number
+    #     of keys a decode step attends over is q-INVARIANT. That is required for
+    #     a LATENCY table, where two rows must do equal work to be comparable,
+    #     and it is why the perf suite pins this mode explicitly rather than
+    #     inheriting it.
+    #
+    #     It is the wrong default for QUALITY, which is why it is no longer the
+    #     default: holding the key count fixed while the keys get cheaper means
+    #     declining to spend the budget that was granted. At cache_budget=0.20 it
+    #     retains 13.8% of full-cache bytes at q=0.5 and 11.4% at q=0.7 while
+    #     still being reported as a 20% cache — understating the compression, and
+    #     paying for it in accuracy to save memory nobody asked to save.
+    #
+    # Under "bytes", past q ~ 0.36 at cache_budget=0.50 the resolved N_q crosses
+    # the whole evictable band and `EvictionPolicy.tier_counts` clamps to the
+    # windows that exist, so the config's stated ratio stops describing what
+    # runs. `describe_tier_geometry` reports the expansion and the
+    # first-eviction drop count so that case is visible rather than implied.
+    quant_budget_mode: str = "bytes"
+    quant_memoize_read: Optional[bool] = None
+    # -- rank-1 read gate (modules/quant/sketch.py) -------------------------
+    # Each int2 window carries a card written once at demotion; the decode step
+    # scans the cards and dequantizes only the windows whose UPPER BOUND clears
+    # the bar. Because the bound is a bound, a skipped window provably carries no
+    # logit above it: the gate can over-select, it cannot miss.
+    #
+    #
+    # Fraction of the step's ACTIVE Q windows to dequantize. 0.25 is the
+    # operating point the efficiency arithmetic is costed on: the card is a
+    # third of a window, so break-even sits at ~0.67 and 0.25 leaves headroom.
+    # 1.0 dequantizes everything and makes the gate a provable no-op.
+    quant_gate_ratio: float = 0.25
+    # Delta, in log space. A window also survives when its bound is within Delta
+    # of its head's best bound -- a top-p, so a peaked head keeps few windows and
+    # a flat head keeps many, with no calibration and no sort. The default `inf`
+    # makes the RATIO the only selector (a deterministic top-k by bound); set a
+    # finite Delta to get the adaptive rule capped by the ratio.
+    quant_gate_margin: float = float("inf")
+    # Absolute cap, overriding the ratio when set. Diagnostics; prefer the ratio.
+    quant_gate_max_windows: Optional[int] = None
+    # Decode step of the FIRST eviction, independent of window_size. Default 0:
+    # the prompt is compressed on decode step 0, before that step's query
+    # attends, so every generated token is produced against the budgeted cache.
+    # Must be a non-negative int; a positive value delays the first compaction
+    # and leaves short answers measured at full cache (see FIRST_EVICTION_STEP
+    # and EvictionPolicy.should_evict).
+    first_eviction_step: int = FIRST_EVICTION_STEP
+
+    def __post_init__(self) -> None:
+        # -- window_size --
+        if not isinstance(self.window_size, int) or isinstance(self.window_size, bool):
+            raise ValueError(
+                f"window_size must be a positive int, got {self.window_size!r}"
+            )
+        if self.window_size <= 0:
+            raise ValueError(
+                f"window_size must be > 0, got {self.window_size}"
+            )
+
+        # -- num_sink_tokens --
+        if not isinstance(self.num_sink_tokens, int) or isinstance(self.num_sink_tokens, bool):
+            raise ValueError(
+                f"num_sink_tokens must be a non-negative int, got {self.num_sink_tokens!r}"
+            )
+        if self.num_sink_tokens < 0:
+            raise ValueError(
+                f"num_sink_tokens must be >= 0, got {self.num_sink_tokens}"
+            )
+
+        # -- cache_budget (must be float, not int, not bool) --
+        if isinstance(self.cache_budget, bool):
+            raise ValueError(
+                f"cache_budget must be a float in (0, 1], got bool {self.cache_budget!r}. "
+                f"bool is rejected because it subclasses int."
+            )
+        if isinstance(self.cache_budget, int):
+            raise ValueError(
+                f"cache_budget must be a float ratio in (0, 1], got int {self.cache_budget}. "
+                f"Use e.g. 0.40 instead of 40."
+            )
+        if not isinstance(self.cache_budget, float):
+            raise ValueError(
+                f"cache_budget must be a float in (0, 1], got {type(self.cache_budget).__name__}"
+            )
+        if not (0.0 < self.cache_budget <= 1.0):
+            raise ValueError(
+                f"cache_budget must be in (0, 1], got {self.cache_budget}"
+            )
+
+        # -- local_window_size --
+        if isinstance(self.local_window_size, bool):
+            raise ValueError("local_window_size must be int or float, got bool")
+        if isinstance(self.local_window_size, int):
+            if self.local_window_size <= 0:
+                raise ValueError(
+                    f"local_window_size as int must be > 0, got {self.local_window_size}"
+                )
+            if self.local_window_size % self.window_size != 0:
+                raise ValueError(
+                    f"local_window_size as int ({self.local_window_size}) must be a "
+                    f"multiple of window_size ({self.window_size})"
+                )
+        elif isinstance(self.local_window_size, float):
+            if not (0.0 < self.local_window_size <= 1.0):
+                raise ValueError(
+                    f"local_window_size as float must be in (0, 1], "
+                    f"got {self.local_window_size}"
+                )
+        else:
+            raise ValueError(
+                f"local_window_size must be int or float, "
+                f"got {type(self.local_window_size).__name__}"
+            )
+
+        # -- rank-1 read gate --
+        gate_live = self.quant_ratio > 0.0
+        if gate_live and self.quant_memoize_read is True:
+            raise ValueError(
+                "quant_memoize_read=True cannot be combined with a LIVE read "
+                "gate: the memo caches the WHOLE dequantized tier keyed on "
+                "store.version -- which only moves at eviction, while the "
+                "gate's selected set moves every step. It would serve a set the "
+                "gate did not choose. Leave it None, or set "
+                ""
+                "per-step selected set and memoizes legitimately."
+            )
+        if not (0.0 < self.quant_gate_ratio <= 1.0):
+            raise ValueError(
+                f"quant_gate_ratio must be in (0, 1], got {self.quant_gate_ratio}. "
+                "1.0 dequantizes every window, i.e. a no-op gate."
+            )
+        if self.quant_gate_margin != float("inf") and self.quant_gate_margin < 0:
+            raise ValueError(
+                f"quant_gate_margin must be >= 0 or inf, got {self.quant_gate_margin}"
+            )
+        if (self.quant_gate_max_windows is not None
+                and self.quant_gate_max_windows < 1):
+            raise ValueError("quant_gate_max_windows must be >= 1 or None")
+
+        # -- quant_budget_mode (what quant_ratio divides) --
+        if self.quant_budget_mode not in ("tokens", "bytes"):
+            raise ValueError(
+                f"quant_budget_mode must be 'tokens' or 'bytes', got "
+                f"{self.quant_budget_mode!r}. 'tokens' keeps the retained key "
+                f"count invariant in quant_ratio; 'bytes' is the historic split "
+                f"and grows the retained key count with it."
+            )
+
+        # -- quant_ratio (two-tier split) --
+        if isinstance(self.quant_ratio, bool):
+            raise ValueError("quant_ratio must be a float in [0, 1], got bool")
+        if isinstance(self.quant_ratio, int) and not isinstance(self.quant_ratio, bool):
+            # allow the literal 0 / 1 as a convenience; promote to float
+            self.quant_ratio = float(self.quant_ratio)
+        if not isinstance(self.quant_ratio, float):
+            raise ValueError(
+                f"quant_ratio must be a float in [0, 1], "
+                f"got {type(self.quant_ratio).__name__}"
+            )
+        if not (0.0 <= self.quant_ratio <= 1.0):
+            raise ValueError(
+                f"quant_ratio must be in [0, 1], got {self.quant_ratio}"
+            )
+        if self.quant_ratio > 0.0 and self.window_size % 4 != 0:
+            # int2 crumb packing needs a window divisible by 4 (4 codes/byte, §2).
+            raise ValueError(
+                f"quant_ratio > 0 requires a window_size divisible by 4 (int2 "
+                f"packing), got window_size={self.window_size}"
+            )
+
+        # -- quant_memoize_read --
+        if self.quant_memoize_read is not None and not isinstance(
+            self.quant_memoize_read, bool
+        ):
+            raise ValueError(
+                f"quant_memoize_read must be None (auto) or bool, got "
+                f"{type(self.quant_memoize_read).__name__}"
+            )
+
+        # -- first_eviction_step (non-negative int; bool rejected before int) --
+        if isinstance(self.first_eviction_step, bool) or not isinstance(
+            self.first_eviction_step, int
+        ):
+            raise ValueError(
+                f"first_eviction_step must be a non-negative int, got "
+                f"{self.first_eviction_step!r}"
+            )
+        if self.first_eviction_step < 0:
+            raise ValueError(
+                f"first_eviction_step must be >= 0, got {self.first_eviction_step}"
+            )
+
+    # -----------------------------------------------------------------
+    # resolve() — pure function, no mutation
+    # -----------------------------------------------------------------
+
+    def resolve(
+        self,
+        prefill_len: int,
+        model_config: Any,
+        kv_dtype: torch.dtype,
+        max_tokens: int,
+    ) -> ResolvedConfig:
+        """Return a :class:`ResolvedConfig` with concrete int counts.
+
+        Pure function; doesn't mutate *self*.  Floor-division on byte→token
+        conversion guarantees the retained cache never exceeds the byte budget.
+
+        Parameters
+        ----------
+        prefill_len : int
+            Number of tokens in the prefill (prompt).
+        model_config
+            HuggingFace ``PretrainedConfig`` (or compatible object) with
+            ``num_key_value_heads``, ``num_attention_heads``, ``hidden_size``,
+            and optionally ``head_dim``.
+        kv_dtype : torch.dtype
+            Data type of the KV cache tensors (e.g. ``torch.float16``).
+        max_tokens : int
+            Maximum number of tokens to be generated.  The budget is sized
+            against the full expected sequence (prefill + generation) so the
+            cache is not undersized when the output is long.
+        """
+        num_kv_heads = getattr(
+            model_config,
+            "num_key_value_heads",
+            getattr(model_config, "num_attention_heads", None),
+        )
+        if num_kv_heads is None:
+            raise ValueError(
+                "model_config must have num_key_value_heads or num_attention_heads"
+            )
+        head_dim = getattr(model_config, "head_dim", None)
+        if head_dim is None:
+            num_heads = getattr(model_config, "num_attention_heads", None)
+            hidden = getattr(model_config, "hidden_size", None)
+            if num_heads is None or hidden is None:
+                raise ValueError(
+                    "model_config must provide head_dim or (num_attention_heads + hidden_size)"
+                )
+            head_dim = hidden // num_heads
+
+        # int2 packs 4 value channels per byte, so head_dim must be a multiple
+        # of 4 (window_size is validated in __post_init__; head_dim only becomes
+        # known here). Real models satisfy this (128); assert it loudly.
+        if self.quant_ratio > 0.0 and head_dim % 4 != 0:
+            raise ValueError(
+                f"quant_ratio > 0 requires head_dim divisible by 4 (int2 crumb "
+                f"packing over the value channel axis), got head_dim={head_dim}"
+            )
+
+        element_size = torch.tensor([], dtype=kv_dtype).element_size()
+        # K + V, each shaped [num_kv_heads, head_dim] per token
+        bytes_per_token = num_kv_heads * head_dim * element_size * 2
+
+        # Total byte budget and token budget
+        total_budget_bytes = int(self.cache_budget * (prefill_len + max_tokens) * bytes_per_token)
+        total_budget_tokens = total_budget_bytes // bytes_per_token
+
+        # Resolve local_window_size to concrete int.
+        # Float local_window_size is a fraction of the CACHE BUDGET (not the
+        # full post-sink context): local ~= ratio * total_budget_tokens, then
+        # ceil and snap up to a window_size multiple. This guarantees the local
+        # region can never exceed the budget. (The previous post-sink-relative
+        # formula could make the local region alone larger than the whole
+        # budget, which either crashed resolve() or starved top-K retention.)
+        if isinstance(self.local_window_size, float):
+            raw = self.local_window_size * total_budget_tokens
+            ceiled = math.ceil(raw)
+            remainder = ceiled % self.window_size
+            if remainder != 0:
+                ceiled += self.window_size - remainder
+            local_tokens = ceiled
+        else:
+            local_tokens = self.local_window_size
+
+        # Top-K evictable windows.
+        #
+        # Sink + local may exceed the budget. That used to raise; it now clamps
+        # to zero evictable windows and proceeds, retaining sink + local only —
+        # an explicitly legal ResolvedConfig (see top_k_windows above).
+        #
+        # The clamp is not cosmetic. `remaining` feeds both top_k_windows and
+        # m_evict below, and Python floor division takes a negative remaining
+        # NEGATIVE (-5 // 8 == -1), which would propagate through top_k_fp / N_q
+        # into n_slots_for() and CacheState(capacity=...) as negative sizes —
+        # failing later, and far less legibly, than the check that was here.
+        #
+        # THE BUDGET IS THEN EXCEEDED, and silently would be the wrong kind of
+        # quiet: the retained cache is num_sink + local_tokens, not
+        # total_budget_tokens, so any bytes/compression figure derived from the
+        # requested budget is wrong for this config. Over-retaining against a
+        # nominal budget is the exact accounting error we fault the
+        # LongBenchSticky baseline for, so say so out loud rather than let a
+        # quiet over-retain look like a legitimate result.
+        remaining = total_budget_tokens - self.num_sink_tokens - local_tokens
+        if remaining < 0:
+            warnings.warn(
+                f"cache_budget yields total_budget_tokens={total_budget_tokens}, "
+                f"below num_sink_tokens ({self.num_sink_tokens}) + local_tokens "
+                f"({local_tokens}). Proceeding with 0 evictable windows: the cache "
+                f"will retain {self.num_sink_tokens + local_tokens} tokens/row "
+                f"(sink + local), EXCEEDING the requested budget by "
+                f"{-remaining} tokens/row. Reported compression for this config is "
+                f"not the requested budget.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            remaining = 0
+        top_k_windows = remaining // self.window_size
+
+        # --- Two-tier split --------------------------------
+        # Only the EVICTABLE window budget is divided between tiers; sink and
+        # local stay fp and are already carved as tokens above. At q=0 this
+        # yields top_k_fp == top_k_windows and N_q == 0 by construction, so the
+        # ResolvedConfig is field-for-field identical to the single-tier path.
+        q = self.quant_ratio
+        # one fp window vs one int2 window, in bytes. The int2 codes are half
+        # the int4 codes (2 bits/elem vs 4), but the fp16 scale/zero grid is
+        # UNCHANGED — same granularity, same dtype — so it is fixed overhead
+        # that now dominates the Q window. window_size % 4 == 0
+        # is validated, so the // 2 below is exact.
+        b_fp = bytes_per_token * self.window_size                       # K+V fp16
+        # The GATE CARD IS PART OF THE WINDOW. It is resident for the life of the
+        # window, it is allocated unconditionally wherever there is a Q tier, and
+        # leaving it out of `b_q` is not a rounding error: at D=128, ws=8, H_kv=8
+        # the card is 3200 B against the codes-plus-grid's 6432, so an unbudgeted
+        # card is a 50% overrun on the exact tier the memory claim is made about.
+        # It was missing here, which meant every reported `cache_budget`
+        # understated the bytes actually held.
+        #
+        # Both halves are priced by the modules that define the formats, not
+        # re-derived here: a window whose layout changes and whose budget does
+        # not is the same bug in a new place.
+        from modules.quant.quantizer import bytes_per_q_window
+        from modules.quant.sketch import sketch_bytes_per_head
+
+        gate_live = q > 0.0
+        b_card = (num_kv_heads * sketch_bytes_per_head(head_dim, self.window_size)
+                  if gate_live else 0)
+        b_q = bytes_per_q_window(num_kv_heads, head_dim, self.window_size) + b_card
+        m_evict = remaining * bytes_per_token                           # evictable bytes
+        if self.quant_budget_mode == "bytes":
+            # Historic split: q divides the BYTES. An int2 window is ~2.8x
+            # cheaper, so the retained WINDOW COUNT grows with q and the cache
+            # can end up holding more keys than the prompt (see the field docs).
+            top_k_fp = int(((1.0 - q) * m_evict) // b_fp)
+            N_q = int((q * m_evict) // b_q) if q > 0.0 else 0
+            # SPEND THE REMAINDER. Two independent floor divisions leave up to
+            # one window of each tier unbought -- and because the leftover is
+            # never spent, the cache quietly runs under budget while the report
+            # says otherwise. Top up one window at a time, each time taking the
+            # tier that keeps the realised byte split closest to `q`, so filling
+            # the budget does not drift the operating point it was resolved at.
+            spent = top_k_fp * b_fp + N_q * b_q
+            while True:
+                room_fp = (spent + b_fp) <= m_evict
+                room_q = q > 0.0 and (spent + b_q) <= m_evict
+                if not (room_fp or room_q):
+                    break
+
+                def _err(dfp: int, dq: int) -> float:
+                    fp_b = (top_k_fp + dfp) * b_fp
+                    q_b = (N_q + dq) * b_q
+                    return abs(q_b / max(fp_b + q_b, 1) - q)
+
+                if room_q and (not room_fp or _err(0, 1) <= _err(1, 0)):
+                    N_q += 1
+                    spent += b_q
+                else:
+                    top_k_fp += 1
+                    spent += b_fp
+        else:
+            # Token split (default): q divides the retained WINDOW COUNT, so
+            # top_k_fp + N_q == top_k_windows for every q. The keys a decode step
+            # attends over — and therefore the decode work, the score-axis width,
+            # and the eviction's tensor widths — are identical at q=0 and q=0.9;
+            # only the bytes those keys cost change. `remaining` is already the
+            # budget's token allowance, so no clamp against the sequence is
+            # needed: the count cannot exceed what the budget bought, and
+            # EvictionPolicy.tier_counts still clamps it to the windows that
+            # exist at any given eviction.
+            N_q = int(round(q * top_k_windows)) if q > 0.0 else 0
+            N_q = min(N_q, top_k_windows)
+            top_k_fp = top_k_windows - N_q
+        # q=0 must reproduce today's count exactly (guard float floor drift).
+        if q == 0.0:
+            top_k_fp = top_k_windows
+
+        resolved = ResolvedConfig(
+            window_size=self.window_size,
+            num_sink_tokens=self.num_sink_tokens,
+            local_tokens=local_tokens,
+            top_k_windows=top_k_windows,
+            bytes_per_token=bytes_per_token,
+            total_budget_bytes=total_budget_bytes,
+            total_budget_tokens=total_budget_tokens,
+            rerotate_on_evict=self.rerotate_on_evict,
+            quant_ratio=q,
+            top_k_fp=top_k_fp,
+            N_q=N_q,
+            quant_budget_mode=self.quant_budget_mode,
+            bytes_per_fp_window=b_fp,
+            bytes_per_q_window=b_q,
+            bytes_per_gate_card=b_card,
+            quant_memoize_read=self.quant_memoize_read,
+            # The gate IS the read path wherever there is a Q tier. There is no
+            # knob: an ungated arm is a second method with different eviction
+            # decisions and a different kernel compile, and keeping one meant
+            # every downstream number had to say which arm it came from.
+            quant_sketch_enabled=q > 0.0,
+            quant_gate_ratio=self.quant_gate_ratio,
+            quant_gate_margin=self.quant_gate_margin,
+            quant_gate_max_windows=self.quant_gate_max_windows,
+            first_eviction_step=self.first_eviction_step,
+        )
+
+        # --- ENFORCE the budget, do not merely compute it --------------------
+        # `budget_utilisation` has always been reported; nothing has ever
+        # refused a configuration that failed to spend what it was granted. A
+        # cache that holds 70% of its allowance is a quality result taken at a
+        # budget nobody asked for, and it reads as a memory win in the table.
+        #
+        # Under 'bytes' the remainder is spent above, so this is reachable only
+        # if the allowance cannot buy a single window of either tier -- a
+        # genuinely unusable budget, worth refusing loudly.
+        #
+        # Under 'tokens' the window COUNT is pinned and the bytes are whatever
+        # the cheaper keys cost, so under-spend is the mode's definition, not a
+        # fault. It is still not allowed to be silent: 'tokens' is a latency
+        # mode, and a quality number taken under it is stated at a budget the
+        # config did not ask for.
+        util = resolved.budget_utilisation
+        if self.quant_budget_mode == "bytes":
+            # The invariant is GRANULARITY-EXACT, not a percentage: the leftover
+            # must be too small to buy another window of any tier. A flat 99%
+            # floor is the wrong shape -- it is unreachable when the allowance
+            # buys only a handful of windows (one fp window is 15% of a 6-window
+            # budget) and it is far too loose when it buys hundreds. At the
+            # shipped shapes this implies >= 99.6%.
+            cheapest = b_q if q > 0.0 else b_fp
+            leftover = m_evict - resolved.retained_evictable_bytes
+            if leftover >= cheapest:
+                raise ValueError(
+                    f"cache_budget={self.cache_budget} leaves {leftover} B of its "
+                    f"{m_evict} B evictable allowance unspent, enough for another "
+                    f"{'int2' if q > 0.0 else 'fp'} window ({cheapest} B"
+                    f"{f', incl. {b_card} B of gate card' if b_card else ''}). "
+                    "The remainder loop should have bought it; this is a bug in "
+                    "resolve(), not a bad configuration."
+                )
+            if util < MIN_BUDGET_UTILISATION:
+                warnings.warn(
+                    f"cache_budget={self.cache_budget} spends {util:.1%} of its "
+                    f"byte allowance ({resolved.retained_bytes} of "
+                    f"{resolved.total_budget_bytes} B). The allowance is fully "
+                    f"spent to within one window ({leftover} B left, cheapest "
+                    f"window {cheapest} B) -- the shortfall is granularity, not "
+                    "waste. It matters anyway: this run holds "
+                    f"{util * self.cache_budget:.1%} of the full cache, not "
+                    f"{self.cache_budget:.1%}. Quote quality numbers against that.",
+                    stacklevel=2,
+                )
+        elif util < MIN_BUDGET_UTILISATION:
+            warnings.warn(
+                f"quant_budget_mode='tokens' at quant_ratio={q} spends "
+                f"{util:.1%} of the byte budget: the window count is pinned, so "
+                f"cheaper int2 keys buy fewer bytes rather than more windows. "
+                f"This run holds {util * self.cache_budget:.1%} of the full "
+                "cache, not cache_budget. Quote quality numbers against that, "
+                "or resolve in 'bytes'.",
+                stacklevel=2,
+            )
+        return resolved

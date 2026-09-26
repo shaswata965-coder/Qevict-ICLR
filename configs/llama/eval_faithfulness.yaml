@@ -1,0 +1,19 @@
+# ============================================================================
+# Faithfulness -- compares a parity base run against a parity ours run
+# (Jaccard of kept windows, attention-distribution metrics per layer).
+# No model load. Run eval_parity_base.yaml and eval_parity_ours_flash.yaml first.
+#   python main.py --config configs/llama/eval_faithfulness.yaml
+#   python scripts/print_faithfulness.py outputs/faithfulness_results.npz
+# ============================================================================
+_base_: ../base.yaml
+
+run:
+  mode: faithfulness
+  seed: 42
+
+faithfulness:
+  base_npz_path: outputs/parity_base_wikitext-103.npz
+  ours_npz_path: outputs/parity_ours_flash_wikitext-103.npz
+
+telemetry:
+  output_dir: outputs

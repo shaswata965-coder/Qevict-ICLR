@@ -1,0 +1,47 @@
+# ============================================================================
+# GSM8K (8-shot chain-of-thought) -- RecoverKV at a 20% cache budget
+# (Llama-3.1-8B-Instruct), at the shipped operating point.
+#
+#   python main.py --config configs/llama/gsm8k_budget20.yaml
+# ============================================================================
+_base_: ../base.yaml
+
+run:
+  mode: gsm8k
+  seed: 42
+
+model:
+  name: meta-llama/Llama-3.1-8B-Instruct
+  revision: main
+  dtype: float16
+  attn_implementation: flash_attention_2     # must match cache.backend_package
+
+cache:
+  backend: windowed
+  backend_package: flash_attn
+  cache_budget: 0.20
+  window_size: 8
+  num_sink_tokens: 5
+  local_window_size: 128
+  quant_ratio: 0.70
+  quant_gate_ratio: 0.25
+  quant_budget_mode: bytes
+  first_eviction_step: 0
+
+window:
+  window_size: 8
+  num_sink_tokens: 5
+  local_window_size: 128
+
+telemetry:
+  track_scores: false
+
+gsm8k:
+  data_dir: data/gsm8k_cot
+  output_dir: outputs/gsm8k/budget20
+  results_dir: outputs/gsm8k
+  num_samples: max
+  shard: 0
+  num_shards: 1
+  skip_oom: false
+  aggressive_cache_clear: false

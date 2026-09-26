@@ -1,0 +1,29 @@
+# RecoverKV -- Python 3.10, CUDA 12.x, an Ampere-or-newer GPU (A100 used for all
+# reported numbers). The flash_attn backend runs Triton kernels and needs CUDA.
+
+torch>=2.6                  # CUDA build; provides triton. The compiled eviction relies on >=2.6 Dynamo behaviour
+transformers>=4.47,<4.48    # pinned: the cache and hooks target the 4.47 attention signatures (checked at start-up)
+accelerate>=0.25            # device_map="auto"
+# flash-attn>=2.5 is required too; it builds against the installed torch, so
+# install it afterwards:  pip install flash-attn --no-build-isolation
+sentencepiece
+protobuf
+
+numpy>=1.24,<2.0
+pyyaml>=6.0
+einops>=0.7
+tqdm
+
+# data: THUDM/LongBench is a script dataset; datasets>=3 refuses to run it
+# (or stage the jsonl files under data/longbench/, see README)
+datasets>=2.16,<3
+
+# LongBench metrics
+rouge
+fuzzywuzzy
+jieba                       # Chinese metrics only
+
+# figures / reports (visualize and analysis suites)
+pandas
+matplotlib>=3.7
+seaborn>=0.13

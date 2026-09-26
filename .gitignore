@@ -1,0 +1,32 @@
+# Byte-compiled / caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Editor / OS junk
+.DS_Store
+*.swp
+
+# Build / virtualenv
+*.egg-info/
+.venv/
+venv/
+
+# Run outputs
+outputs/
+results/
+scores/
+logs/
+*.npz
+
+# Downloaded eval corpora / dataset caches. `data/` itself is source (loaders);
+# only the fetched payloads are ignored, which is where a work tree quietly
+# grows by thousands of files after a LongBench or RULER run.
+data/longbench/
+data/ruler/
+data/wikitext*/
+data/pg19/
+.cache/
+.triton/
+
+data/gsm8k_cot/

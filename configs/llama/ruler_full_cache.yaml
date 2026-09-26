@@ -1,0 +1,37 @@
+# ============================================================================
+# RULER -- FullKV baseline (Llama-3.1-8B-Instruct)
+#
+# Same data and tasks as ruler_ours_flash_attn.yaml, transformers DynamicCache.
+#   python main.py --config configs/llama/ruler_full_cache.yaml \
+#       --override ruler.data_dir=/path/to/ruler/32768
+# ============================================================================
+_base_: ../base.yaml
+
+run:
+  mode: ruler
+  seed: 42
+
+model:
+  name: meta-llama/Llama-3.1-8B-Instruct
+  revision: main
+  dtype: float16
+  attn_implementation: flash_attention_2
+
+cache:
+  backend: dynamic                           # FullKV
+  backend_package: null
+  cache_budget: null
+
+telemetry:
+  track_scores: false
+
+ruler:
+  data_dir: data/ruler/32768                 # override with your RULER split
+  tasks: null                                # null = all 13 tasks
+  num_samples: max
+  capture_memory: false
+  output_dir: outputs/ruler/32768_full_cache
+  seed: 42
+  resume: false
+  skip_oom: false
+  aggressive_cache_clear: false

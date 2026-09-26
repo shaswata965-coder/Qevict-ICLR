@@ -1,0 +1,109 @@
+# ============================================================================
+# Perf -- batched throughput and the max-batch search (Llama-3.1-8B-Instruct)
+#
+# At batch 1 decode is bound by the weight read (every weight once per step),
+# which no KV cache can change. Batching amortizes that read, and the batch is
+# capped by KV memory -- which is what the method compresses. So the claim is
+# decode tokens/s at the largest batch that fits.
+#
+# Every config runs at every grid cell; skip_if_oom turns the batch ladder into
+# a max-B search (a config's max-B is the largest batch it did not skip).
+# Quote throughput_decode_tokps (batch / tpot_steady) or throughput_e2e_tokps,
+# never the legacy throughput_tokps. scripts/print_perf_batched.py prints this.
+#   python main.py --config configs/llama/eval_perf_batched.yaml
+#   python scripts/print_perf_batched.py --npz-dir outputs/perf_batched
+#
+# Rows sweep cache_budget (0.20 / 0.10) x quant_ratio (0.0 / 0.5). Under
+# quant_budget_mode: bytes, q does not change per-row memory; it changes how
+# many tokens that memory retains.
+# ============================================================================
+_base_: ../base.yaml
+
+run:
+  mode: perf
+  seed: 42
+
+model:
+  name: meta-llama/Llama-3.1-8B-Instruct
+  revision: main
+  dtype: float16
+
+window:
+  window_size: 8
+  num_sink_tokens: 5
+  local_window_size: 64
+
+cache:
+  quant_budget_mode: bytes
+
+perf:
+  data_source: "2wikimqa"                    # real text, chunked to exactly prefill_len per row
+  configs:
+    - name: full_cache
+      cache_backend: dynamic
+      cache_package: null
+      attn_implementation: flash_attention_2
+      cache_budget: null
+      requires_flash_attn: true
+    - name: ours_b20_q00
+      cache_backend: windowed
+      cache_package: flash_attn
+      attn_implementation: flash_attention_2
+      cache_budget: 0.20
+      quant_ratio: 0.0
+      requires_flash_attn: true
+    - name: ours_b20_q50
+      cache_backend: windowed
+      cache_package: flash_attn
+      attn_implementation: flash_attention_2
+      cache_budget: 0.20
+      quant_ratio: 0.5
+      requires_flash_attn: true
+    - name: ours_b10_q00
+      cache_backend: windowed
+      cache_package: flash_attn
+      attn_implementation: flash_attention_2
+      cache_budget: 0.10
+      quant_ratio: 0.0
+      requires_flash_attn: true
+    - name: ours_b10_q50
+      cache_backend: windowed
+      cache_package: flash_attn
+      attn_implementation: flash_attention_2
+      cache_budget: 0.10
+      quant_ratio: 0.5
+      requires_flash_attn: true
+
+  grid:
+    # A: short prompt, 1024 generated tokens
+    - { prefill_len: 512, gen_len: 1024, batch_size: 1 }
+    - { prefill_len: 512, gen_len: 1024, batch_size: 8 }
+    - { prefill_len: 512, gen_len: 1024, batch_size: 32 }
+    - { prefill_len: 512, gen_len: 1024, batch_size: 128 }
+    - { prefill_len: 512, gen_len: 1024, batch_size: 256 }
+    - { prefill_len: 512, gen_len: 1024, batch_size: 512 }
+    # B: short prompt, long generation
+    - { prefill_len: 512, gen_len: 4096, batch_size: 1 }
+    - { prefill_len: 512, gen_len: 4096, batch_size: 32 }
+    - { prefill_len: 512, gen_len: 4096, batch_size: 128 }
+    - { prefill_len: 512, gen_len: 4096, batch_size: 256 }
+    # C: long prompt, short generation (the prefill peak binds here)
+    - { prefill_len: 4096, gen_len: 128, batch_size: 1 }
+    - { prefill_len: 4096, gen_len: 128, batch_size: 16 }
+    - { prefill_len: 4096, gen_len: 128, batch_size: 32 }
+    - { prefill_len: 4096, gen_len: 128, batch_size: 64 }
+
+  prefill_logits: last_only
+  num_warmup_runs: 1
+  warmup_decode_steps: null
+  num_measurement_runs: 5
+  cooldown_s: 3.0
+  enable_clock_locking: true
+  clock_settle_s: 5.0
+  allow_shared_gpu: false
+  skip_if_oom: true
+  skip_if_flash_attn_unavailable: true
+
+telemetry:
+  track_scores: false
+  output_dir: outputs/perf_batched

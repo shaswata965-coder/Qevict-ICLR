@@ -1,0 +1,57 @@
+# ============================================================================
+# Parity -- base run (Meta-Llama-3-8B-Instruct, FullKV)
+#
+# Greedy-decodes 50 WikiText-103 articles (2048 prefill + 1024 generated) with
+# the full cache and records, per step, the attention mass every key receives
+# and the window ranking it implies. The ours run is teacher-forced on these
+# tokens so the two are compared step for step.
+# Writes outputs/parity_base_wikitext-103.npz.
+#   python main.py --config configs/llama/eval_parity_base.yaml
+# The base and ours runs must agree on model, data and window geometry
+# (checked at load time by utils.config.validate_parity_pair).
+# ============================================================================
+_base_: ../base.yaml
+
+run:
+  mode: parity_base
+  seed: 42
+
+output_path: outputs/parity_base_wikitext-103.npz
+
+model:
+  name: meta-llama/Meta-Llama-3-8B-Instruct
+  revision: main
+  dtype: float16
+  attn_implementation: flash_attention_2
+
+cache:
+  backend: dynamic                          # full cache, no eviction
+  backend_package: null
+  cache_budget: 0.25                        # the comparison target (not applied here)
+  window_size: 32
+  num_sink_tokens: 4
+  local_window_size: 256
+
+data:
+  dataset: wikitext-103
+  article_id: 0
+  prefill_len: 2048
+  gen_len: 1024
+
+parity:
+  dataset: wikitext-103
+  num_articles: 50
+  article_index: 0
+  min_article_tokens: 4096
+  prefill_len: 2048
+  gen_len: 1024
+  decoding: greedy
+
+window:
+  window_size: 32
+  num_sink_tokens: 4
+  local_window_size: 256
+
+telemetry:
+  track_scores: true
+  output_dir: outputs

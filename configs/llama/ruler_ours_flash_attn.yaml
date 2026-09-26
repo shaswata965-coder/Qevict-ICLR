@@ -1,0 +1,59 @@
+# ============================================================================
+# RULER -- RecoverKV, flash_attn backend (Llama-3.1-8B-Instruct)
+#
+# All 13 RULER tasks (500 examples each) at one context length, at the shipped
+# operating point (see configs/llama/longbench_ours_flash_attn.yaml).
+#
+# Data: the pre-generated RULER splits (HF `datasets` saved with
+# save_to_disk; one directory per context length: 4096 / 16384 / 32768), e.g.
+# the `ruler/<len>` folders of the DefensiveKV release. Point data_dir at one:
+#   python main.py --config configs/llama/ruler_ours_flash_attn.yaml \
+#       --override ruler.data_dir=/path/to/ruler/32768
+# One task only (e.g. to spread tasks over GPUs):
+#       --override ruler.tasks=[niah_multikey_3]
+# Window-size ablation (set both blocks):
+#       --override cache.window_size=32 window.window_size=32
+# ============================================================================
+_base_: ../base.yaml
+
+run:
+  mode: ruler
+  seed: 42
+
+model:
+  name: meta-llama/Llama-3.1-8B-Instruct
+  revision: main
+  dtype: float16
+  attn_implementation: flash_attention_2     # must match cache.backend_package
+
+cache:
+  backend: windowed
+  backend_package: flash_attn
+  cache_budget: 0.20
+  window_size: 8
+  num_sink_tokens: 5
+  local_window_size: 128
+  quant_ratio: 0.70
+  quant_gate_ratio: 0.25
+  quant_budget_mode: bytes
+  rerotate_on_evict: false
+  first_eviction_step: 0
+
+window:
+  window_size: 8
+  num_sink_tokens: 5
+  local_window_size: 128
+
+telemetry:
+  track_scores: false
+
+ruler:
+  data_dir: data/ruler/32768                 # override with your RULER split
+  tasks: null                                # null = all 13 tasks
+  num_samples: max
+  capture_memory: false                      # true: per-example byte-accounting report
+  output_dir: outputs/ruler/32768_ours_flash_attn
+  seed: 42
+  resume: false                              # true skips tasks whose jsonl already exists
+  skip_oom: false
+  aggressive_cache_clear: false

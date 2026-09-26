@@ -1,0 +1,18 @@
+# ============================================================================
+# QEvict observations -- attention skew, window-level eviction decisions and
+# revival, computed from a parity base/ours pair. No model load.
+#   python main.py --config configs/llama/eval_qevict.yaml
+# (scripts/run_qevict_observations.sh records the parity pair and runs this.)
+# ============================================================================
+_base_: ../base.yaml
+
+run:
+  mode: qevict_observations
+  seed: 42
+
+faithfulness:
+  base_npz_path: outputs/parity_base_wikitext-103.npz
+  ours_npz_path: outputs/parity_ours_flash_wikitext-103.npz
+
+telemetry:
+  output_dir: outputs

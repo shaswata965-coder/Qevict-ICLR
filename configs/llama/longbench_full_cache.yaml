@@ -1,0 +1,53 @@
+# ============================================================================
+# LongBench -- FullKV baseline (Llama-3.1-8B-Instruct)
+#
+# transformers DynamicCache: no eviction, no quantization.
+#   python main.py --config configs/llama/longbench_full_cache.yaml
+# Score with:  scripts/score_longbench.sh <output_dir>
+# ============================================================================
+_base_: ../base.yaml
+
+run:
+  mode: longbench
+  seed: 42
+
+model:
+  name: meta-llama/Llama-3.1-8B-Instruct
+  revision: main
+  dtype: float16
+  attn_implementation: flash_attention_2
+
+cache:
+  backend: dynamic                      # FullKV
+  backend_package: null
+  cache_budget: null
+
+telemetry:
+  track_scores: false
+
+longbench:
+  datasets:                             # the 16 English LongBench datasets
+    - narrativeqa
+    - qasper
+    - multifieldqa_en
+    - hotpotqa
+    - 2wikimqa
+    - musique
+    - gov_report
+    - qmsum
+    - multi_news
+    - trec
+    - triviaqa
+    - samsum
+    - passage_count
+    - passage_retrieval_en
+    - lcc
+    - repobench-p
+  include_chinese: false
+  use_e_variants: false                 # LongBench-E length-stratified variants
+  max_length: null                        # no truncation: Llama-3.1 has a 128K context
+  output_dir: outputs/longbench/full_cache
+  seed: 42
+  resume: false
+  skip_oom: true                        # record OOM'd examples as pred=null
+  aggressive_cache_clear: false

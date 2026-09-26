@@ -1,0 +1,68 @@
+# ============================================================================
+# LongBench -- RecoverKV, flash_attn backend (Mistral-7B-Instruct-v0.2)
+#
+# The operating point used for every headline number (utils.config.OPERATING_POINT):
+# 20% cache budget, window 8, 5 sink + 128 local tokens in fp16, 70% of the
+# evictable budget (by bytes) in the int2 tier, read gate opening 25% of the
+# int2 windows per step, prompt compacted on decode step 0.
+#   python main.py --config configs/mistral/longbench_ours_flash_attn.yaml
+# Score with:  scripts/score_longbench.sh <output_dir>
+# ============================================================================
+_base_: ../base.yaml
+
+run:
+  mode: longbench
+  seed: 42
+
+model:
+  name: mistralai/Mistral-7B-Instruct-v0.2
+  revision: main
+  dtype: float16
+  attn_implementation: flash_attention_2      # must match cache.backend_package
+
+cache:
+  backend: windowed
+  backend_package: flash_attn
+  cache_budget: 0.20                        # fraction of the full KV cache kept
+  window_size: 8                            # eviction granularity (tokens per window)
+  num_sink_tokens: 5                        # leading tokens, fp16, never evicted
+  local_window_size: 128                    # most recent tokens, fp16, never evicted
+  quant_ratio: 0.70                         # share of the evictable budget in the int2 tier (0 = fp16 only)
+  quant_gate_ratio: 0.25                    # read gate: fraction of int2 windows opened per step (1.0 = all)
+  quant_budget_mode: bytes                  # quant_ratio splits the byte budget (memory-matched)
+  first_eviction_step: 0                    # compact the prompt on decode step 0
+
+window:                                     # same geometry; the parity/perf suites read this block
+  window_size: 8
+  num_sink_tokens: 5
+  local_window_size: 128
+
+telemetry:
+  track_scores: false
+
+longbench:
+  datasets:                                 # the 16 English LongBench datasets
+    - narrativeqa
+    - qasper
+    - multifieldqa_en
+    - hotpotqa
+    - 2wikimqa
+    - musique
+    - gov_report
+    - qmsum
+    - multi_news
+    - trec
+    - triviaqa
+    - samsum
+    - passage_count
+    - passage_retrieval_en
+    - lcc
+    - repobench-p
+  include_chinese: false
+  use_e_variants: false
+  max_length: 31500                        # Mistral-7B-Instruct-v0.2: 32K context, published LongBench truncation
+  output_dir: outputs/longbench/mistral_ours_flash_attn_compression_0.8
+  seed: 42
+  resume: false
+  skip_oom: false
+  aggressive_cache_clear: false
