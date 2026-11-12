@@ -27,3 +27,6 @@ jieba                       # Chinese metrics only
 pandas
 matplotlib>=3.7
 seaborn>=0.13
+
+# tests (python -m pytest tests; CPU-only, see README)
+pytest>=7.4

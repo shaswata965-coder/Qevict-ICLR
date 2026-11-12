@@ -179,6 +179,19 @@ def main() -> int:
     p.add_argument("--interpret", action="store_true",
                    help="CPU, TRITON_INTERPRET=1: checks 3-5 only")
     a = p.parse_args()
+    if a.interpret and not torch.cuda.is_available():
+        # A CPU-only machine: Triton's autotuner asks for a GPU driver when the
+        # score kernel module is imported, and Inductor's vectorized C++ backend
+        # cannot compile the eviction graph. Neither applies on a GPU.
+        import torch._inductor.config as _inductor_config
+
+        _inductor_config.cpp.simdlen = 0
+        try:
+            import triton
+        except ImportError:
+            triton = None
+        if triton is not None:
+            triton.autotune = lambda *args, **kwargs: (lambda fn: fn)
 
     from models.deepseek_v2 import attention as A
     from models.deepseek_v2.loader import install_recoverkv_mla, make_cache

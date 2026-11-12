@@ -247,6 +247,23 @@ records every measured run; the table printers report the median by default:
 The `throughput_tokps` field kept in the npz files for backward compatibility
 leaves out the prefill-to-decode interval; do not quote it.
 
+## Tests
+
+```bash
+python -m pytest tests            # CPU only, no model download; add -n 4 with pytest-xdist
+```
+
+The suite checks the method's arithmetic, not GPU speed. Every Triton kernel
+has a CPU reference that mirrors its tiling and masking, and the tests pin the
+kernels to those references: under `TRITON_INTERPRET=1` when Triton is
+installed, otherwise against the references directly. The cache, eviction,
+read gate, card widths, promotion and completion knobs, the DeepSeek-V2 latent
+port and the runners' batching are all exercised end to end on small random
+models. Tests that need CUDA or flash-attn skip without them; on a GPU,
+`python scripts/deepseek_gpu_preflight.py` checks the GPU-only paths.
+`tests/conftest.py` sets two CPU-only options and says why; neither touches a
+GPU run.
+
 ## Configuration
 
 A run is `python main.py --config <yaml> [--override key=value ...]`. Configs
@@ -341,6 +358,7 @@ data/                       dataset loaders; LongBench prompt/metric configs
 longgenbench_eval/          LongGenBench data, vLLM judge and scoring (self-contained)
 utils/                      config schema, cache factory, memory probe, logging
 scripts/                    per-suite wrappers around main.py and table printers
+tests/                      CPU test suite (python -m pytest tests)
 ```
 
 ## Citation
