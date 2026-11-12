@@ -56,6 +56,7 @@ import torch
 from torch import Tensor
 
 from modules.quant.quantizer import grid_group
+from modules.quant.sketch import card_field_layout
 
 try:  # pragma: no cover - import guard, exercised only where triton is present
     import triton
@@ -117,7 +118,7 @@ def decode_kernel_available(cuda: bool) -> bool:
 def describe_decode_backend(cuda: bool) -> str:
     """Human string for the decode attention backend, given CUDA availability."""
     if not fused_decode_enabled():
-        return "materialize (fused decode disabled via STICKYKV_FUSED_DECODE=0)"
+        return "materialize (fused decode disabled via RECOVERKV_FUSED_DECODE=0)"
     if decode_kernel_available(cuda):
         return "TRITON fused two-tier decode kernel (required)"
     reason = "triton not installed" if not _HAS_TRITON else "not running on CUDA"
@@ -315,8 +316,19 @@ def two_tier_window_reference(
     sel: Optional[Tensor] = None,
     logmass: Optional[Tensor] = None,
     centroids: Optional[Tensor] = None,
+    completion: Optional[dict] = None,
 ) -> Tuple[Tensor, Tensor]:
     """CPU oracle for the kernel's **windowed** output, tile for tile.
+
+    ``completion`` is the SPEC of the completion-term ablation
+    (``utils/completion_spec.py``), computed directly from this oracle's own
+    read-set output and ``lse`` -- never by inverting the output, which is what
+    the production epilogue (``completion.apply_completion``) does and what this
+    exists to check. ``None`` is the shipped term. Otherwise a dict with
+    ``mode`` (``calibrated`` / ``off`` / ``uncalibrated``), and optionally
+    ``scale``, ``sigma``, ``eps`` (standard normals ``[B, H_q, n_active]``) and
+    ``scores`` (``output`` / ``coupled``). Needs ``sel``, ``logmass`` and
+    ``centroids``.
 
     This is deliberately not a shortcut. It reproduces the kernel's actual
     algorithm — sink prologue, window-tiled body, window-tiled Q tier, the online
@@ -563,11 +575,36 @@ def two_tier_window_reference(
         if centroids is not None:
             skipped = (~read).to(fill.dtype)
             mhat = fill * skipped                              # [B,H_q,n_active]
+            den_fill = 1.0 + mhat.sum(-1, keepdim=True)
+            if completion is not None:
+                mode = completion["mode"]
+                if mode == "off":
+                    mhat = torch.zeros_like(mhat)
+                elif mode == "uncalibrated":
+                    # lse is the READ SET's log-normaliser, log Z_A, in this
+                    # oracle's units; logmass is natural-log.
+                    lse_nat = lse.unsqueeze(-1) * (math.log(2.0) if exp2 else 1.0)
+                    mhat = (logmass.float() - lse_nat).exp() * skipped
+                elif mode == "calibrated":
+                    mhat = mhat * float(completion.get("scale", 1.0))
+                    sigma = float(completion.get("sigma", 0.0))
+                    if sigma > 0.0:
+                        mp = mhat * (sigma * completion["eps"]).exp() * skipped
+                        mhat = mp * (mhat.sum(-1, keepdim=True)
+                                     / mp.sum(-1, keepdim=True).clamp_min(1e-38))
+                else:
+                    raise ValueError(f"unknown completion mode {mode!r}")
             out = out.float() + torch.einsum(
                 "bhw,bhwd->bhd", mhat, centroids.to(torch.float32))
             den = 1.0 + mhat.sum(-1, keepdim=True)
             out = out / den
-            wsum = wsum / den
+            if completion is not None and completion.get("scores", "output") == "coupled":
+                wsum = torch.cat([
+                    wsum[..., :n_body_win],
+                    torch.where(read, wsum[..., n_body_win:], mhat),
+                ], dim=-1) / den
+            else:
+                wsum = wsum / den_fill
     return out.to(v_eff.dtype), wsum
 
 
@@ -577,6 +614,10 @@ def two_tier_window_reference(
 # ---------------------------------------------------------------------------
 
 if _HAS_TRITON:
+
+    # The card-field unpack the gate kernel reads mu/v/t with, reused for the
+    # value centroid so every card field has one lane map at every width.
+    from .gate_kernel import _card_codes
 
     @triton.jit
     def _two_tier_decode_kernel(
@@ -589,7 +630,7 @@ if _HAS_TRITON:
         COS, SIN,                  # RoPE halves [B, n*ws, D//2]
         SEL,                       # gate's pick: int32/int64 [B, H_kv, n_sel]
         LOGM,                      # gate's per-window log-mass: fp32 [B, H_q, n]
-        VM, VMS, VANC,             # value centroids: int4-packed u8 [B,n,H_kv,D//2], fp16 [B,n,H_kv], fp32 [B,H_kv,D]
+        VM, VMS, VANC,             # value centroids: [B,n,H_kv,D*VM_BITS//8] (int4-packed u8 by default), fp16 [B,n,H_kv], fp32 [B,H_kv,D]
         OUT, WSUM, WMAX,
         scale,
         H_q, H_kv, n_active, n_sel, Sfp, rep, num_sink, n_body_win, W_phys,
@@ -602,6 +643,7 @@ if _HAS_TRITON:
         BLOCK_W: tl.constexpr, PACK_K: tl.constexpr, PACK_V: tl.constexpr,
         GROUP_K: tl.constexpr, GROUP_V: tl.constexpr,
         GATED: tl.constexpr, LOG2E: tl.constexpr,
+        VM_BITS: tl.constexpr,
     ):
         """One program == one (batch, KV head); all ``rep`` query heads at once.
 
@@ -698,10 +740,12 @@ if _HAS_TRITON:
         vsgn = H_kv * GV
         vsgh = GV
         cob = n_active * WS * HALF
-        # VM is int4, packed two per byte along D, so its row is HALF wide.
-        vmb = n_active * H_kv * HALF
-        vmn = H_kv * HALF
-        vmh = HALF
+        # VM is packed along D at VM_BITS (the `quant_card_bits` knob), so its
+        # row is D * VM_BITS / 8 bytes wide: HALF at the shipped int4, D at int8.
+        VMW: tl.constexpr = HEAD_DIM * VM_BITS // 8
+        vmb = n_active * H_kv * VMW
+        vmn = H_kv * VMW
+        vmh = VMW
         vmsb = n_active * H_kv
         vmsn = H_kv
         vab = H_kv * HEAD_DIM
@@ -774,9 +818,6 @@ if _HAS_TRITON:
 
         cbyte = (offs_d // 4)
         cshift = (2 * (offs_d % 4)).to(tl.uint8)
-        # int4 lane map for the value centroids: two per byte along D.
-        vbyte = (offs_d // 2)
-        vshift = (4 * (offs_d % 2)).to(tl.uint8)
         byte_t = (t_tok // 4)
         shift_t = (2 * (t_tok % 4)).to(tl.uint8)
         # A statement, not a ternary: `if` on a constexpr is the form Triton's
@@ -995,12 +1036,11 @@ if _HAS_TRITON:
                 # exactly as the Q loop dequantizes codes -- no fp16 centroid
                 # tensor is ever built.
                 qmask = cmask & (cols >= n_body_win)
-                # int4 nibbles, +8 biased: element d is byte d//2, shift 4*(d%2)
-                # -- the same unpack as the Q loop's int2 crumbs, one width up.
-                vb_ = tl.load(VM + b * vmb + qc[:, None] * vmn + kv * vmh
-                              + vbyte[None, :],
-                              mask=qmask[:, None], other=0)
-                vq = (((vb_ >> vshift[None, :]) & 0xF).to(tl.float32) - 8.0)
+                # At VM_BITS (`_card_codes`). At the shipped int4 these are
+                # nibbles, +8 biased: element d is byte d//2, shift 4*(d%2) --
+                # the same unpack as the Q loop's int2 crumbs, one width up.
+                vq = _card_codes(VM + b * vmb + qc[:, None] * vmn + kv * vmh,
+                                 offs_d[None, :], qmask[:, None], VM_BITS)
                 vsc = tl.load(VMS + b * vmsb + qc * vmsn + kv,
                               mask=qmask, other=0.0).to(tl.float32)
                 vbar = vq * vsc[:, None] + vanc[None, :]
@@ -1037,8 +1077,8 @@ if _HAS_TRITON:
 #: against, and it is why this cache is opt-in per buffer rather than applied to
 #: everything allocated here.
 #:
-#: `bfbdb1f` -- *"revert the reusable ctx dict -- it caused the narrativeqa OOM"*
-#: -- is the standing precedent. A reused buffer holds memory the caching
+#: A reusable ctx dict was once reverted because it caused a narrativeqa OOM;
+#: that is the standing precedent. A reused buffer holds memory the caching
 #: allocator would otherwise recycle, and the headline cell already peaks near
 #: 48 GB. Keying on the exact shape means a changed geometry allocates a new
 #: turns the whole thing off if `peak_GB` moves in the perf table.
@@ -1064,7 +1104,7 @@ def _scratch(name: str, shape, dtype, device):
     # ONE buffer per name, replaced when the geometry moves -- never accumulated.
     # `W_phys` tracks `n_active`, which moves at every eviction, so a cache keyed
     # on shape would keep a buffer per distinct window count for the whole
-    # generation. That is the `bfbdb1f` narrativeqa OOM with extra steps. Holding
+    # generation. That is the narrativeqa OOM above with extra steps. Holding
     # one means a changed shape costs exactly the allocation it costs today, and
     # the steady state -- where every step has the same geometry -- still reuses.
     buf = torch.empty(shape, dtype=dtype, device=device)
@@ -1383,6 +1423,8 @@ def _decode_triton(
     sel: Optional[Tensor] = None,
     logmass: Optional[Tensor] = None,
     centroids: Optional[Tuple[Tensor, Tensor, Tensor]] = None,
+    vm_bits: int = 4,
+    out_dtype: Optional[torch.dtype] = None,
 ) -> Tuple[Tensor, Tensor]:
     """Launch the fused decode kernel.
 
@@ -1433,7 +1475,7 @@ def _decode_triton(
 
     # `out` is NOT scratch: it leaves this function as the model's attention
     # output and stays live until that layer's o_proj has consumed it.
-    out = torch.empty((B, H_q, D), device=q.device, dtype=q.dtype)
+    out = torch.empty((B, H_q, D), device=q.device, dtype=out_dtype or q.dtype)
     # `wsum` is consumed by the score gather inside `_run_fused` and `wmax` is
     # never read outside the kernel, so both are dead before the next layer runs.
     wsum = _scratch("wsum", (B, H_q, W_phys), torch.float32, q.device)
@@ -1477,8 +1519,7 @@ def _decode_triton(
         if not t.is_contiguous():
             raise RuntimeError(
                 f"fused decode requires a contiguous {name}; its strides are "
-                f"derived from its shape inside the kernel (DECODE_SPEED_PLAN "
-                f"§5.2). Got shape {tuple(t.shape)} strides {tuple(t.stride())}."
+                f"derived from its shape inside the kernel. Got shape {tuple(t.shape)} strides {tuple(t.stride())}."
             )
 
     n_sel = check_gate_selection(sel, B, H_kv, n_active)
@@ -1505,17 +1546,20 @@ def _decode_triton(
                 "skips attend through them, and without them 75% of the tier "
                 "would be silently absent from the attention output.")
         VM, VMS, VANC = centroids
-        # int4, packed two per byte along D (modules/quant/sketch._q_sym4), so
-        # the stored row is D//2 wide. Checked rather than inferred: a full-width
-        # int8 centroid would read the right number of BYTES and the wrong
-        # VALUES, which is the failure mode a shape check exists to catch.
-        if VM.shape != (B, n_active, H_kv, D // 2):
+        # At `vm_bits` (modules/quant/sketch._q_symb): int4 by default, packed
+        # two per byte along D, so the stored row is D//2 wide. Checked rather
+        # than inferred: a centroid at the wrong width would read the right
+        # number of BYTES and the wrong VALUES, which is the failure mode a
+        # shape check exists to catch.
+        vm_width, vm_dtype = card_field_layout(D, vm_bits)
+        if VM.shape != (B, n_active, H_kv, vm_width):
             raise RuntimeError(
-                f"centroid codes must be int4-packed [B, n_active, H_kv, D//2] = "
-                f"[{B}, {n_active}, {H_kv}, {D // 2}]; got {tuple(VM.shape)}.")
-        if VM.dtype != torch.uint8:
+                f"centroid codes at {vm_bits} bits must be [B, n_active, H_kv, "
+                f"{vm_width}] = [{B}, {n_active}, {H_kv}, {vm_width}]; got "
+                f"{tuple(VM.shape)}.")
+        if VM.dtype != vm_dtype:
             raise RuntimeError(
-                f"centroid codes must be uint8 (packed int4 nibbles); got "
+                f"centroid codes at {vm_bits} bits must be {vm_dtype}; got "
                 f"{VM.dtype}.")
         if VMS.shape != (B, n_active, H_kv):
             raise RuntimeError(
@@ -1586,8 +1630,12 @@ def _decode_triton(
     # are bucketed by bit length so the fp store's one-token-per-step growth
     # between evictions does not re-trigger the search every step; `B` is exact
     # because it moves the grid.
+    # The output buffer's dtype joins it too: an fp32 OUT (the completion
+    # ablation's epilogue, see `out_dtype`) is a separate specialization, and its
+    # winner is not evidence about the shipped fp16 store's.
     sig = (int(ws), int(D), int(BLOCK_R), int(W_phys > 0), bool(gated),
-           int(B), int(Sfp).bit_length(), int(n_sel).bit_length())
+           int(B), int(Sfp).bit_length(), int(n_sel).bit_length(), int(vm_bits),
+           out.dtype == torch.float32)
 
     def _launch(rung):
         target_keys, num_stages, num_warps = rung
@@ -1609,7 +1657,7 @@ def _decode_triton(
             BLOCK_W=BLOCK_W,
             PACK_K=max(ws // 4, 1), PACK_V=max(D // 4, 1),
             GROUP_K=gk, GROUP_V=gv,
-            GATED=gated, LOG2E=_LOG2E,
+            GATED=gated, LOG2E=_LOG2E, VM_BITS=vm_bits,
             num_stages=num_stages, num_warps=num_warps,
         )
 
@@ -1639,6 +1687,8 @@ def fused_two_tier_decode(
     sel: Optional[Tensor] = None,
     logmass: Optional[Tensor] = None,
     centroids: Optional[Tuple[Tensor, Tensor, Tensor]] = None,
+    vm_bits: int = 4,
+    out_dtype: Optional[torch.dtype] = None,
 ) -> Tuple[Tensor, Tensor]:
     """Fused decode attention + score. **Triton-or-raise** — no PyTorch fallback.
 
@@ -1651,6 +1701,12 @@ def fused_two_tier_decode(
         it, so the kernel's window axis matches the caller's score axis exactly.
     sel : the gate's ``[B, H_kv, n_sel]`` int32/int64 pick of active columns, or None
         to read the whole tier.
+    vm_bits : the width the value centroids were built at (``CardBits.vm``,
+        the ``quant_card_bits`` knob); 4 is the shipped card.
+    out_dtype : dtype of the output buffer. ``None`` (shipped) is ``q.dtype``.
+        The completion ablation passes ``float32`` so its epilogue can invert the
+        kernel's output exactly; the kernel's store casts to the buffer's dtype,
+        so the kernel source is the same either way.
 
     Returns ``(out [B,H_q,D], wsum [B,H_q,W_phys])`` — per-window softmax mass in
     physical order (body windows, then Q windows). ``W_phys`` counts the **whole**
@@ -1666,5 +1722,13 @@ def fused_two_tier_decode(
             f"({reason}); there is no PyTorch decode fallback in production "
             "(the reference is for tests only). See assert_decode_kernel_available."
         )
+    if qtier is not None and qtier.get("value_alias", False):
+        # An MLA latent (models/deepseek_v2): one KV head of width Dc+Dr whose
+        # value is its latent lanes. Same algorithm, same contract; the kernel
+        # differs only in how it tiles a non-power-of-two head and in reading V
+        # from the key tile (mla_decode_kernel's docstring lists all three).
+        from .mla_decode_kernel import mla_decode_triton
+        return mla_decode_triton(q, k_fp, qtier, scaling, num_sink, n_body_win,
+                                 sel, logmass, centroids, vm_bits)
     return _decode_triton(q, k_fp, v_fp, qtier, scaling, num_sink, n_body_win,
-                          sel, logmass, centroids)
+                          sel, logmass, centroids, vm_bits, out_dtype)

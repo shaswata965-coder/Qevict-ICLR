@@ -70,8 +70,17 @@ class QuantizedStore:
         n_slots: int,
         memoize_read: bool = True,
         sketch_enabled: bool = False,
+        card_bits=None,
+        shadow_dtype: Optional[torch.dtype] = None,
+        value_alias: bool = False,
     ) -> None:
         self.window_size = window_size
+        # MLA (models/deepseek_v2/geometry.py): the value is the key's latent
+        # dims. The window is quantized ONCE, as a key (per channel, pre-RoPE);
+        # every value read returns the dequantized key, whose latent dims are
+        # exactly the latent (RoPE is an exact identity on them), and the
+        # card's value centroid is its `mu`. False everywhere else.
+        self.value_alias = bool(value_alias)
         self.head_dim = head_dim
         self.num_kv_heads = num_kv_heads
         self.n_slots = n_slots
@@ -80,6 +89,16 @@ class QuantizedStore:
         # Rank-1 gate cards (modules/quant/sketch.py). Off by default: with it
         # off nothing is allocated and every path below is the pre-gate one.
         self.sketch_enabled = sketch_enabled
+        # Each card field's width (the `quant_card_bits` knob, sketch.CardBits).
+        # Parsed once here so every later call hands the encoder, the gate and
+        # the slot table the same validated object.
+        from .sketch import parse_card_bits
+        self.card_bits = parse_card_bits(card_bits)
+        # Evaluation-only fp shadow of every demoted window's ORIGINAL K and V
+        # (`quant_promote_source="original"`, slots.SHADOW_FIELDS). `None` in
+        # every shipped configuration: nothing is allocated and promotion
+        # dequantizes, as it always has.
+        self.shadow_dtype = shadow_dtype
         # [B, H_kv, D] common mode, FROZEN at the first demotion batch. It must
         # be frozen, not running: a card is written once and never revisited,
         # so a later anchor change would silently reinterpret every card
@@ -121,6 +140,9 @@ class QuantizedStore:
                 num_kv_heads=self.num_kv_heads,
                 device=device,
                 sketch=self.sketch_enabled,
+                card_bits=self.card_bits,
+                shadow_dtype=self.shadow_dtype,
+                value_alias=self.value_alias,
             )
         elif self.table.batch_size != batch_size:
             raise ValueError(
@@ -154,8 +176,11 @@ class QuantizedStore:
                     f"join_layers: layer {i} has {s._n_active} active Q windows, "
                     f"layer 0 has {ref._n_active} — layers must stay in lockstep"
                 )
-            if (s.window_size, s.head_dim, s.num_kv_heads, s.n_slots) != (
-                    ref.window_size, ref.head_dim, ref.num_kv_heads, ref.n_slots):
+            if (s.window_size, s.head_dim, s.num_kv_heads, s.n_slots,
+                    s.card_bits, s.shadow_dtype, s.value_alias) != (
+                        ref.window_size, ref.head_dim, ref.num_kv_heads,
+                        ref.n_slots, ref.card_bits, ref.shadow_dtype,
+                        ref.value_alias):
                 raise RuntimeError(
                     f"join_layers: layer {i}'s store geometry differs from layer 0's"
                 )
@@ -174,6 +199,9 @@ class QuantizedStore:
             n_slots=ref.n_slots,
             memoize_read=ref.memoize_read,
             sketch_enabled=ref.sketch_enabled,
+            card_bits=ref.card_bits,
+            shadow_dtype=ref.shadow_dtype,
+            value_alias=ref.value_alias,
         )
         # Anchors are per-row already, so joining is the same row-axis concat the
         # tables use: layer i owns rows [i*B, (i+1)*B).
@@ -285,9 +313,12 @@ class QuantizedStore:
         # treat it as opaque and reduce only over the quant group, so this is the
         # singular op applied slice-wise — bit-identical, one launch per tier.
         k_flat = keys_pre_rope.reshape(B * n, H, S, D)
-        v_flat = values.reshape(B * n, H, S, D)
         k_codes, k_scale, k_zero = quantize_key_windows(k_flat)
-        v_codes, v_scale, v_zero = quantize_value_windows(v_flat)
+        if self.value_alias:
+            v_codes = v_scale = v_zero = None
+        else:
+            v_flat = values.reshape(B * n, H, S, D)
+            v_codes, v_scale, v_zero = quantize_value_windows(v_flat)
 
         sketch = None
         if self.sketch_enabled:
@@ -298,7 +329,10 @@ class QuantizedStore:
                 )
             from .sketch import build_sketch
             kp = keys_post_rope.reshape(B * n, H, S, D).to(torch.float32)
-            vp = values.reshape(B * n, H, S, D).to(torch.float32)
+            # Aliased: the value IS the key, so its anchor is the key anchor and
+            # the card stores no centroid of its own (`build_sketch`).
+            vp = (kp if self.value_alias
+                  else values.reshape(B * n, H, S, D).to(torch.float32))
             if self._anchor is None:
                 # Frozen here, from the first batch of demoted windows: the mean
                 # over (window, token) of this layer's keys, per row and head.
@@ -309,7 +343,18 @@ class QuantizedStore:
                 self._v_anchor = vp.reshape(B, n, H, S, D).mean(dim=(1, 3))
             anc = self._anchor.repeat_interleave(n, dim=0)          # [B*n, H, D]
             vanc = self._v_anchor.repeat_interleave(n, dim=0)
-            sketch = tuple(build_sketch(kp, anc, vp, vanc))
+            sketch = tuple(build_sketch(kp, anc, vp, vanc, self.card_bits,
+                                        value_alias=self.value_alias))
+
+        shadow = None
+        if self.shadow_dtype is not None:
+            if keys_post_rope is None:
+                raise ValueError(
+                    "the fp shadow (quant_promote_source='original') needs "
+                    "keys_post_rope: the oracle returns the keys exactly as the "
+                    "fp store held them.")
+            shadow = (keys_post_rope.to(self.shadow_dtype),
+                      None if self.value_alias else values.to(self.shadow_dtype))
 
         self.table.write(
             slot_idx, valid, wid,
@@ -317,7 +362,13 @@ class QuantizedStore:
             v_codes, v_scale, v_zero,
             position_ranges.to(torch.long),
             sketch=sketch,
+            shadow=shadow,
         )
+
+    @property
+    def shadow_enabled(self) -> bool:
+        """Whether promotion returns the original fp window (the oracle arm)."""
+        return self.shadow_dtype is not None
 
     # -- promotion -----------------------------------------------------------
 
@@ -352,13 +403,44 @@ class QuantizedStore:
         keys = dequantize_key_windows(
             k_codes, k_scale, k_zero, self.window_size, out_dtype=out_dtype
         )
-        values = dequantize_value_windows(
+        # Aliased: the value is the key's latent dims, pre- or post-RoPE alike.
+        values = keys if self.value_alias else dequantize_value_windows(
             v_codes, v_scale, v_zero, self.head_dim, out_dtype=out_dtype
         )
         self.table.set_active(slot_idx, valid, False)
         return (
             keys.reshape(B, n, H, S, D),
             values.reshape(B, n, H, S, D),
+            pos.reshape(B, n, S),
+        )
+
+    def promote_many_original(
+        self, slot_idx: Tensor, valid: Tensor, out_dtype: torch.dtype
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        """:meth:`promote_many`, returning the window's ORIGINAL fp K and V.
+
+        The evaluation-only oracle of the promotion-payload experiment
+        (``quant_promote_source="original"``): same bookkeeping -- the entry goes
+        dormant, not free -- but the payload is the shadow written at first
+        demotion, so a promoted window is bit-identical to what was demoted.
+
+        Returns ``(keys_post_rope, values, position_ranges)``: the keys are
+        ALREADY rotated (the shadow holds them as the fp store did), so the
+        caller must not apply RoPE again.
+        """
+        self._invalidate()
+        B = slot_idx.shape[0]
+        n = int(slot_idx.shape[1])
+        H, S, D = self.num_kv_heads, self.window_size, self.head_dim
+        keys, values = self.table.gather_shadow(slot_idx)
+        if values is None:                    # aliased value (MLA)
+            values = keys
+        sp = self.table.slot_pos
+        pos = sp.view(sp.shape[0] * sp.shape[1], S)[self.table._flat(slot_idx)]
+        self.table.set_active(slot_idx, valid, False)
+        return (
+            keys.to(out_dtype).reshape(B, n, H, S, D),
+            values.to(out_dtype).reshape(B, n, H, S, D),
             pos.reshape(B, n, S),
         )
 
@@ -404,7 +486,8 @@ class QuantizedStore:
 
         slots = self.table.active_order(self._n_active)
         card = Sketch(*self.table.gather_sketch(slots))
-        logmass, _ = gate_and_score(query, card, self._anchor, scaling)
+        logmass, _ = gate_and_score(query, card, self._anchor, scaling,
+                                    self.card_bits)
         # Union the GQA group FIRST, then select. The KV head is the unit of
         # work -- one program loads a window once for every query head sharing
         # it -- so the cap has to bind there. Capping per query head and unioning
@@ -430,7 +513,7 @@ class QuantizedStore:
         from .sketch import Sketch, value_centroid
 
         card = Sketch(*self.table.gather_sketch(slots))
-        return value_centroid(card, self._v_anchor)
+        return value_centroid(card, self._v_anchor, self.card_bits)
 
     def gated_q_tier(
         self,
@@ -508,9 +591,6 @@ class QuantizedStore:
         k_codes = take(t.key_codes)                    # [B,H,n_sel,D,S//4]
         k_scale = take_grid("key_scale_q", "key_scale_s")
         k_zero = take_grid("key_zero_q", "key_zero_s")
-        v_codes = take(t.val_codes)                    # [B,H,n_sel,S,D//4]
-        v_scale = take_grid("val_scale_q", "val_scale_s")
-        v_zero = take_grid("val_zero_q", "val_zero_s")
         pos = take(t.slot_pos, head_axis=False)        # [B,H,n_sel,S]
 
         # Fold the head axis into the batch axis: the read kernel treats its
@@ -524,6 +604,13 @@ class QuantizedStore:
             S, pos_flat, rope_module, out_dtype, BH, n_sel, 1, D,
         ).reshape(B, H, n_sel * S, D)
 
+        if self.value_alias:
+            # The value is the key's latent dims; RoPE is an exact identity on
+            # them, so the rotated key serves (`geometry.py`).
+            return keys, keys, pos.reshape(B, H, n_sel * S)
+        v_codes = take(t.val_codes)                    # [B,H,n_sel,S,D//4]
+        v_scale = take_grid("val_scale_q", "val_scale_s")
+        v_zero = take_grid("val_zero_q", "val_zero_s")
         values = dequantize_value_windows(
             v_codes.reshape(BH * n_sel, 1, S, D // 4),
             v_scale.reshape(BH * n_sel, 1, S), v_zero.reshape(BH * n_sel, 1, S),
@@ -590,6 +677,15 @@ class QuantizedStore:
             k_codes, k_scale, k_zero, self.window_size, pos_flat,
             rope_module, out_dtype, B, n, H, D,
         )
+
+        if self.value_alias:
+            # The value is the key's latent dims, and RoPE is an exact identity
+            # on them, so the rotated key IS the value (`geometry.py`). One
+            # tensor, returned twice, as the fp tier's `value_states` is.
+            result = (keys, keys, pos_flat)
+            if self.memoize_read:
+                self._read_cache = (key, result)
+            return result
 
         # Values carry no RoPE (asymmetric store) — just dequant, then
         # window-major -> token-major: [B, n, H, S, D] -> [B, H, n*S, D].

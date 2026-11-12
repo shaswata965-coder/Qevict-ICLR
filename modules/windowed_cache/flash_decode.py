@@ -69,7 +69,12 @@ _PENDING: dict = {"ctx": None}
 #: SHAPE), so it costs no kernel launch and no device sync — the read fraction is
 #: readable without a ``.item()`` anywhere on the decode path.
 _STATS: dict = {"armed": 0, "fired": 0, "gated": 0,
-                "windows_read": 0, "windows_active": 0}
+                "windows_read": 0, "windows_active": 0,
+                # The completion-term ablation's epilogue
+                # (modules/windowed_cache/completion.py). 0 on the shipped
+                # path; on an ablation arm it must equal `gated`, which is the
+                # proof the variant was applied on every gated layer.
+                "completion_applied": 0}
 
 
 def stats() -> dict:
@@ -95,6 +100,40 @@ def reset_stats() -> None:
     """Zero the counters (per-run harnesses; tests)."""
     for k in _STATS:
         _STATS[k] = 0
+
+
+#: Evaluation-only observer of the gate's pick. ``None`` in every production run.
+#:
+#: The counters above say THAT the gate ran and how much it read. They cannot say
+#: WHICH windows it read, and that is the question the observation suite has to
+#: answer: how much of each query head's real attention mass sat in the int2
+#: windows the gate opened, versus the ones it skipped and credited through
+#: their centroids (``modules/evaluation/qevict_observations.py``, Observation
+#: IV). The pick only exists inside :func:`_run_fused`, because the gate needs
+#: the query, so this is the one place it can be seen.
+#:
+#: Called as ``fn(layer_idx, sel, logmass)`` with the tensors the gate returned,
+#: after the gate and before the kernel. The observer must not modify them. The
+#: cost with no observer installed is one dict read per fused layer.
+_OBSERVER: dict = {"fn": None}
+
+
+def set_gate_observer(fn) -> None:
+    """Install ``fn(layer_idx, sel, logmass)``. Raises if one is already installed.
+
+    Refusing a second observer, rather than replacing it, keeps a stale observer
+    from an earlier run in the same process from being silently shadowed (or
+    silently kept, which would record one run's picks into another's arrays).
+    """
+    if _OBSERVER["fn"] is not None and fn is not None:
+        raise RuntimeError(
+            "a gate observer is already installed; clear_gate_observer() first")
+    _OBSERVER["fn"] = fn
+
+
+def clear_gate_observer() -> None:
+    """Remove the gate observer. Idempotent."""
+    _OBSERVER["fn"] = None
 
 
 #: Verdicts :func:`gate_report` can return, as stable strings a runner can store
@@ -247,7 +286,7 @@ _DIAGNOSIS = (
     "padding attention_mask reaches it. The fused path cannot serve that call, "
     "and letting it through would attend over the fp tier alone (Q tier "
     "dropped) with no eviction scores written. Use equal-length prompts (no "
-    "padding), or set STICKYKV_FUSED_DECODE=0 to run the Phase-1 materialize "
+    "padding), or set RECOVERKV_FUSED_DECODE=0 to run the Phase-1 materialize "
     "path, which is correct under varlen."
 )
 
@@ -359,11 +398,15 @@ def _run_fused(ctx: dict, q_flash: torch.Tensor,
     k_fp = _undo_repeat_kv(k_fp, h_kv)
     v_fp = _undo_repeat_kv(v_fp, h_kv)
     sel, logmass = fused_gate(
-        q_hd, gate["card"], gate["anchor"], ctx["scaling"], gate["n_sel"])
+        q_hd, gate["card"], gate["anchor"], ctx["scaling"], gate["n_sel"],
+        bits=gate["bits"])
     # Shapes only — no device sync, no launch. See _STATS.
     _STATS["gated"] += 1
     _STATS["windows_read"] += int(sel.shape[-1])
     _STATS["windows_active"] += int(logmass.shape[-1])
+    observer = _OBSERVER["fn"]
+    if observer is not None:
+        observer(ctx["layer_idx"], sel, logmass)
 
     # 2. Attend over [sink | fp body | selected Q], scoring as it goes. The
     #    kernel also scores the windows it skipped, from `logmass`, AND attends
@@ -371,10 +414,32 @@ def _run_fused(ctx: dict, q_flash: torch.Tensor,
     #    both in an epilogue pass that already runs. Doing either on the host cost
     #    22 torch ops here, 704 launches per token at L=32, on a path bound by
     #    launch count.
+    spec = getattr(ctx["cache"].resolved, "quant_completion", None)
+    # The shipped call is exactly the pre-knob call: `out_dtype` is passed only
+    # on an ablation arm, which needs the kernel's output in fp32 to invert it.
+    extra = {} if spec is None else {"out_dtype": torch.float32}
     out, wsum = fused_two_tier_decode(
         q_hd, k_fp, v_fp, ctx["qtier"], ctx["scaling"], num_sink, n_body_win,
         sel=sel, logmass=logmass, centroids=gate["centroid"],
+        vm_bits=gate["bits"].vm, **extra,
     )                                     # out [B,H_q,D], wsum [B,H_q,W_phys]
+
+    # 2b. Evaluation only: the completion-term ablation. `spec is None` on the
+    #     shipped path, which is then exactly what it was before the knob. On an
+    #     ablation arm the kernel wrote `out` in fp32, and the epilogue recovers
+    #     o_bar, the fill and log Z_A from it and applies the variant
+    #     (completion.py; checked against two_tier_window_reference on CPU).
+    if spec is not None:
+        from .completion import apply_completion
+        wids = None
+        if spec.sigma > 0.0:
+            wids = ctx["cache"]._stores[ctx["layer_idx"]].active_ids()
+        out, wsum = apply_completion(
+            spec, out=out, wsum=wsum, n_body_win=n_body_win, sel=sel,
+            logmass=logmass, centroids=gate["centroid"], vm_bits=gate["bits"].vm,
+            q=q_hd, k_fp=k_fp, scaling=ctx["scaling"], wids=wids,
+            layer_idx=ctx["layer_idx"], out_dtype=q_hd.dtype)
+        _STATS["completion_applied"] += 1
 
     # §5.1: the kernel already reduced S -> W in registers, so all that is left is
     # the physical -> merged-id permutation. This replaces
@@ -392,6 +457,38 @@ def _run_fused(ctx: dict, q_flash: torch.Tensor,
         wsum, -1, idx)
 
     return out.unsqueeze(1)                            # [B, 1, H_q, D] (flash layout)
+
+
+def pending() -> Optional[dict]:
+    """The armed fused context, without consuming it (``None`` if unarmed)."""
+    return _PENDING["ctx"]
+
+
+def run_pending(q_flash: torch.Tensor, k_flash: torch.Tensor,
+                v_flash: torch.Tensor) -> torch.Tensor:
+    """Consume the armed context and run :func:`_run_fused` -- for an OWNED forward.
+
+    The ``flash_attn_func`` wrapper below is the seam for models whose attention
+    calls transformers' module-global symbol (Llama, Qwen2). DeepSeek-V2's remote
+    code imports ``flash_attn_func`` into its own namespace, so that seam is never
+    reached; its attention forward is owned instead
+    (``models/deepseek_v2/attention.py``) and calls this at exactly the point the
+    wrapper would have been called. It is the same ``_run_fused`` -- the same read
+    gate, the same ``fired`` / ``gated`` counters, the same verdicts -- so there
+    is still one decode read path, reached by a second door.
+
+    Raises :class:`FusedDecodeNotReached` if nothing is armed: an owned forward
+    that thinks it is on the fused path when the cache did not arm it would be
+    attending over the fp tier alone.
+    """
+    ctx = _PENDING["ctx"]
+    if ctx is None:
+        raise FusedDecodeNotReached(
+            "run_pending() with no armed fused context: the cache did not hand "
+            "this layer an int2 tier, so there is nothing to fuse.")
+    _PENDING["ctx"] = None
+    _STATS["fired"] += 1
+    return _run_fused(ctx, q_flash, k_flash, v_flash)
 
 
 def _make_wrapper(orig):

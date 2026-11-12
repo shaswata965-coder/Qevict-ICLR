@@ -11,9 +11,12 @@ attention, so the model runs ``flash_attention_2`` like every other suite.
 
 The arithmetic follows the reference attention in transformers 4.47: logits in
 the query dtype, softmax in fp32, probabilities cast back to the query dtype,
-then summed over the query rows (fp32 accumulation, one rounding). Causal masking uses the absolute positions of
-this step's queries (the last ``T`` of ``S`` keys). Query rows are processed in
-chunks so the ``[B, H_q, chunk, S]`` block stays bounded at long prefills.
+then summed over the query rows in fp32. The sum is returned in fp32 and NOT
+rounded back to the query dtype: the parity runner accumulates it across decode
+steps, and an fp16 step sum would round small steps away. Causal masking uses
+the absolute positions of this step's queries (the last ``T`` of ``S`` keys).
+Query rows are processed in chunks so the ``[B, H_q, chunk, S]`` block stays
+bounded at long prefills.
 """
 
 from __future__ import annotations
@@ -80,7 +83,7 @@ class AttentionMassRecorder:
         self._cache = cache
 
     def pop(self) -> List[Tensor]:
-        """Per-layer ``[B, H_q, S]`` mass from the last forward, in layer order."""
+        """Per-layer ``[B, H_q, S]`` fp32 mass from the last forward, in layer order."""
         if len(self._mass) != self._n_layers:
             raise RuntimeError(
                 f"attention mass recorded for {len(self._mass)} of "
@@ -121,8 +124,8 @@ class AttentionMassRecorder:
         s = k.shape[2]
         scale = getattr(module, "scaling", head_dim ** -0.5)
 
-        # fp32 accumulator over chunks, rounded once: the same result as one
-        # reduction over all query rows of the query-dtype probabilities.
+        # fp32 accumulator over chunks: the same result as one fp32 reduction
+        # over all query rows of the query-dtype probabilities.
         mass = torch.zeros(b, q.shape[1], s, dtype=torch.float32, device=q.device)
         key_pos = torch.arange(s, device=q.device)
         for c0 in range(0, t, QUERY_CHUNK):
@@ -134,4 +137,4 @@ class AttentionMassRecorder:
                 logits = logits.masked_fill(future, torch.finfo(logits.dtype).min)
             probs = torch.softmax(logits, dim=-1, dtype=torch.float32).to(q.dtype)
             mass += probs.float().sum(dim=-2)
-        self._mass[layer] = mass.to(q.dtype)
+        self._mass[layer] = mass

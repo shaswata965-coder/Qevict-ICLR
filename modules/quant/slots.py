@@ -29,7 +29,7 @@ The table's invariant — **at most one slot per row carries a given window id**
 is what makes that match resolve to a single slot, so ``argmax`` over it is
 unambiguous rather than first-match-wins.
 
-**Dormant entries stay resident.** design §10 forbids re-quantizing on
+**Dormant entries stay resident.** The format forbids re-quantizing on
 re-demotion (it would pick up fp16 rounding from the intermediate promote
 dequant and could flip boundary codes), so a promoted window keeps its slot with
 ``slot_active = False``. That is why allocation goes through a free list rather
@@ -75,6 +75,16 @@ drops it with its window, ``set_active`` reactivates it on re-demotion without
 recomputation, and ``join_layers`` folds it layer-major. None of those needed a
 code change -- only this name list."""
 
+SHADOW_FIELDS = ("sh_key", "sh_val")
+"""The ORIGINAL fp K (post-RoPE) and V of each window, ``[B, N, H, ws, D]``.
+
+Evaluation-only (``quant_promote_source="original"``): the oracle arm of the
+promotion-payload experiment, where a promoted window gets back exactly what it
+was demoted from instead of its int2 reconstruction. It rides the slot table
+for the same reason the card does -- written once at first demotion, dropped
+with its window, kept across re-demotions -- and is NOT in the byte budget,
+which is what makes it an oracle rather than a method."""
+
 
 def n_slots_for(top_k_fp: int, n_q: int) -> int:
     """Slots needed per row, with margin. Bounded — no growth policy.
@@ -118,8 +128,16 @@ class QuantSlotTable:
         num_kv_heads: int,
         device: torch.device,
         sketch: bool = False,
+        card_bits=None,
+        shadow_dtype: Optional[torch.dtype] = None,
+        value_alias: bool = False,
     ) -> None:
         B, N, H, D, S = batch_size, n_slots, num_kv_heads, head_dim, window_size
+        # MLA (models/deepseek_v2/geometry.py): the value is the key's latent
+        # dims, so a window stores its KEY codes and key grid only. Every value
+        # column -- codes, grid, card centroid, shadow -- is absent (None) and
+        # every read hands back None in its place; the store substitutes the key.
+        self.value_alias = bool(value_alias)
         self.batch_size = B
         self.n_slots = N
         self.window_size = S
@@ -135,11 +153,15 @@ class QuantSlotTable:
         self.key_scale_s = torch.zeros((B, N, H, gk), dtype=torch.float16, device=device)
         self.key_zero_q = torch.zeros((B, N, H, D), dtype=torch.int8, device=device)
         self.key_zero_s = torch.zeros((B, N, H, gk), dtype=torch.float16, device=device)
-        self.val_codes = torch.zeros((B, N, H, S, D // 4), dtype=torch.uint8, device=device)
-        self.val_scale_q = torch.zeros((B, N, H, S), dtype=torch.uint8, device=device)
-        self.val_scale_s = torch.zeros((B, N, H, gv), dtype=torch.float16, device=device)
-        self.val_zero_q = torch.zeros((B, N, H, S), dtype=torch.int8, device=device)
-        self.val_zero_s = torch.zeros((B, N, H, gv), dtype=torch.float16, device=device)
+        if self.value_alias:
+            self.val_codes = self.val_scale_q = self.val_scale_s = None
+            self.val_zero_q = self.val_zero_s = None
+        else:
+            self.val_codes = torch.zeros((B, N, H, S, D // 4), dtype=torch.uint8, device=device)
+            self.val_scale_q = torch.zeros((B, N, H, S), dtype=torch.uint8, device=device)
+            self.val_scale_s = torch.zeros((B, N, H, gv), dtype=torch.float16, device=device)
+            self.val_zero_q = torch.zeros((B, N, H, S), dtype=torch.int8, device=device)
+            self.val_zero_s = torch.zeros((B, N, H, gv), dtype=torch.float16, device=device)
         self.slot_wid = torch.full((B, N), FREE, dtype=torch.long, device=device)
         self.slot_active = torch.zeros((B, N), dtype=torch.bool, device=device)
         self.slot_pos = torch.zeros((B, N, S), dtype=torch.long, device=device)
@@ -154,24 +176,50 @@ class QuantSlotTable:
         # works on it unchanged. A head-major layout would coalesce no better --
         # the inner dim is what matters -- and would need a `slots.py` refactor.
         self.sketch = sketch
+        # Each card field's width, from the `quant_card_bits` knob
+        # (modules/quant/sketch.CardBits). It decides the stored shape and dtype
+        # of every `sk_*_q` column below, so it is part of the table's geometry.
+        from .sketch import card_field_layout, parse_card_bits
+        self.card_bits = parse_card_bits(card_bits)
         if sketch:
-            # int4, packed two per byte along D (modules/quant/sketch._q_sym4).
-            # mu and vbar are 64% of the card and neither needs int8's range, so
-            # halving them is what takes the card from 400 B/head to 272 and
-            # moves the gate's break-even read ratio from 0.50 to 0.66.
-            self.sk_mu_q = torch.zeros((B, N, H, D // 2), dtype=torch.uint8, device=device)
+            # At the default, mu and vbar are int4 packed two per byte along D
+            # (modules/quant/sketch._q_symb) and v and t are int8. mu and vbar
+            # are 64% of the card and neither needs int8's range, so halving
+            # them is what takes the card from 400 B/head to 272 and moves the
+            # gate's break-even read ratio from 0.50 to 0.66. `card_field_layout`
+            # gives each field's width and dtype at whatever the knob says.
+            cb = self.card_bits
+
+            def field(n: int, bits: int) -> Tensor:
+                width, dtype = card_field_layout(n, bits)
+                return torch.zeros((B, N, H, width), dtype=dtype, device=device)
+
+            self.sk_mu_q = field(D, cb.mu)
             self.sk_mu_s = torch.zeros((B, N, H), dtype=torch.float16, device=device)
-            self.sk_v_q = torch.zeros((B, N, H, D), dtype=torch.int8, device=device)
+            self.sk_v_q = field(D, cb.v)
             self.sk_v_s = torch.zeros((B, N, H), dtype=torch.float16, device=device)
-            self.sk_t_q = torch.zeros((B, N, H, S), dtype=torch.int8, device=device)
+            self.sk_t_q = field(S, cb.t)
             self.sk_t_s = torch.zeros((B, N, H), dtype=torch.float16, device=device)
             # Value-side centroid. This is what makes a SKIPPED window contribute
             # to the attention output instead of vanishing from it; its weight is
             # the card's mass estimate, recalibrated every step against the
             # windows that were actually read. It replaces the `eps` residual
             # field, which served a bound the fused gate never implemented.
-            self.sk_vm_q = torch.zeros((B, N, H, D // 2), dtype=torch.uint8, device=device)
-            self.sk_vm_s = torch.zeros((B, N, H), dtype=torch.float16, device=device)
+            if self.value_alias:
+                self.sk_vm_q = self.sk_vm_s = None       # the centroid is `mu`
+            else:
+                self.sk_vm_q = field(D, cb.vm)
+                self.sk_vm_s = torch.zeros((B, N, H), dtype=torch.float16, device=device)
+
+        # The oracle's fp shadow (SHADOW_FIELDS). Not allocated unless asked for,
+        # so every shipped configuration is byte-identical to before it existed.
+        self.shadow = shadow_dtype is not None
+        if self.shadow:
+            self.sh_key = torch.zeros((B, N, H, S, D), dtype=shadow_dtype,
+                                      device=device)
+            self.sh_val = (None if self.value_alias else
+                           torch.zeros((B, N, H, S, D), dtype=shadow_dtype,
+                                       device=device))
 
         # Row offsets for flat indexing. Scattering with a broadcast [B, n, H, D,
         # ws//2] index tensor would allocate an int64 index the size of the codes
@@ -202,8 +250,12 @@ class QuantSlotTable:
         ref = tables[0]
         for i, t in enumerate(tables):
             if (t.n_slots, t.window_size, t.head_dim, t.num_kv_heads,
-                    t.batch_size) != (ref.n_slots, ref.window_size, ref.head_dim,
-                                      ref.num_kv_heads, ref.batch_size):
+                    t.batch_size, t.card_bits, getattr(t, "shadow", False),
+                    getattr(t, "value_alias", False)) != (
+                        ref.n_slots, ref.window_size, ref.head_dim,
+                        ref.num_kv_heads, ref.batch_size, ref.card_bits,
+                        getattr(ref, "shadow", False),
+                        getattr(ref, "value_alias", False)):
                 raise RuntimeError(
                     f"join_layers: layer {i}'s slot table geometry differs from "
                     "layer 0's; every layer resolves the same config, so this "
@@ -216,19 +268,44 @@ class QuantSlotTable:
         joint.head_dim = ref.head_dim
         joint.num_kv_heads = ref.num_kv_heads
         joint.sketch = ref.sketch
-        fields = ["key_codes", *GRID_FIELDS, "val_codes",
-                  "slot_wid", "slot_active", "slot_pos"]
-        if ref.sketch:
-            fields += list(SKETCH_FIELDS)
-        for field in fields:
+        joint.card_bits = ref.card_bits
+        joint.shadow = getattr(ref, "shadow", False)
+        joint.value_alias = getattr(ref, "value_alias", False)
+        for field in ref.present_fields():
             setattr(joint, field, torch.cat(
                 [getattr(t, field) for t in tables], dim=0
             ).contiguous())
+        for field in ref.absent_fields():
+            setattr(joint, field, None)
         joint._row_base = (
             torch.arange(joint.batch_size, device=ref.slot_wid.device)
             * joint.n_slots
         ).unsqueeze(1)
         return joint
+
+    def present_fields(self) -> list:
+        """Every tensor column this table actually holds, in a stable order."""
+        alias = getattr(self, "value_alias", False)
+        fields = ["key_codes", *GRID_FIELDS[:4]]
+        if not alias:
+            fields += [*GRID_FIELDS[4:], "val_codes"]
+        fields += ["slot_wid", "slot_active", "slot_pos"]
+        if self.sketch:
+            fields += list(SKETCH_FIELDS[:6] if alias else SKETCH_FIELDS)
+        if getattr(self, "shadow", False):
+            fields += list(SHADOW_FIELDS[:1] if alias else SHADOW_FIELDS)
+        return fields
+
+    def absent_fields(self) -> list:
+        """The value columns an aliased table does not hold (None)."""
+        if not getattr(self, "value_alias", False):
+            return []
+        out = [*GRID_FIELDS[4:], "val_codes"]
+        if self.sketch:
+            out += list(SKETCH_FIELDS[6:])
+        if getattr(self, "shadow", False):
+            out += list(SHADOW_FIELDS[1:])
+        return out
 
     # -- flat addressing -----------------------------------------------------
 
@@ -322,6 +399,7 @@ class QuantSlotTable:
         v_zero: QGrid,
         pos: Tensor,
         sketch: Optional[Sequence[Tensor]] = None,
+        shadow: Optional[Sequence[Tensor]] = None,
     ) -> None:
         """Write ``n`` fresh entries per row, masked by ``valid``.
 
@@ -355,9 +433,13 @@ class QuantSlotTable:
             flat[fi] = torch.where(m, src.reshape(cur.shape).to(cur.dtype), cur)
 
         put(self.key_codes, k_codes)
-        put(self.val_codes, v_codes)
-        for name, src_t in zip(GRID_FIELDS, (*k_scale, *k_zero, *v_scale, *v_zero)):
-            put(getattr(self, name), src_t)
+        if self.value_alias:
+            for name, src_t in zip(GRID_FIELDS[:4], (*k_scale, *k_zero)):
+                put(getattr(self, name), src_t)
+        else:
+            put(self.val_codes, v_codes)
+            for name, src_t in zip(GRID_FIELDS, (*k_scale, *k_zero, *v_scale, *v_zero)):
+                put(getattr(self, name), src_t)
         put(self.slot_pos, pos)
         if sketch is not None:
             if not self.sketch:
@@ -366,7 +448,23 @@ class QuantSlotTable:
                     "without them; pass sketch=True to QuantSlotTable."
                 )
             for name, src in zip(SKETCH_FIELDS, sketch):
+                if getattr(self, name) is None:      # aliased centroid
+                    continue
                 put(getattr(self, name), src)
+        if shadow is not None:
+            if not self.shadow:
+                raise RuntimeError(
+                    "write() was given shadow fields but the table was built "
+                    "without them; pass shadow_dtype to QuantSlotTable.")
+            for name, src in zip(SHADOW_FIELDS, shadow):
+                if getattr(self, name) is None:      # aliased value
+                    continue
+                put(getattr(self, name), src)
+        elif self.shadow:
+            raise RuntimeError(
+                "this table keeps an fp shadow (quant_promote_source='original') "
+                "but write() got none: a window demoted without its original "
+                "would be promoted back from zeros.")
         put(self.slot_wid, wid)
         put(self.slot_active, torch.ones_like(valid))
 
@@ -404,12 +502,33 @@ class QuantSlotTable:
             flat = store.view(store.shape[0] * store.shape[1], *store.shape[2:])
             return flat[fi]
 
+        if self.value_alias:
+            g = [take(getattr(self, name)) for name in GRID_FIELDS[:4]]
+            return (
+                take(self.key_codes), QGrid(g[0], g[1]), QGrid(g[2], g[3]),
+                None, None, None,
+                take(self.slot_pos),
+            )
         g = [take(getattr(self, name)) for name in GRID_FIELDS]
         return (
             take(self.key_codes), QGrid(g[0], g[1]), QGrid(g[2], g[3]),
             take(self.val_codes), QGrid(g[4], g[5]), QGrid(g[6], g[7]),
             take(self.slot_pos),
         )
+
+    def gather_shadow(self, slot_idx: Tensor) -> Tuple[Tensor, Tensor]:
+        """The original fp ``(K post-RoPE, V)`` of ``[B, n]`` slots, each
+        ``[B*n, H, ws, D]`` (flattened like :meth:`gather`)."""
+        if not self.shadow:
+            raise RuntimeError("this slot table keeps no fp shadow")
+        fi = self._flat(slot_idx)
+
+        def take(store: Tensor) -> Tensor:
+            return store.view(store.shape[0] * store.shape[1],
+                              *store.shape[2:])[fi]
+
+        return take(self.sh_key), (None if self.sh_val is None
+                                   else take(self.sh_val))
 
     def gather_sketch(self, slot_idx: Tensor) -> Tuple[Tensor, ...]:
         """The eight card fields for ``[B, n]`` slots, keeping the ``[B, n]``
@@ -422,6 +541,9 @@ class QuantSlotTable:
         out = []
         for name in SKETCH_FIELDS:
             st = getattr(self, name)
+            if st is None:                    # aliased centroid (MLA)
+                out.append(None)
+                continue
             flat = st.view(st.shape[0] * st.shape[1], *st.shape[2:])
             out.append(flat[fi].reshape(B, n, *st.shape[2:]))
         return tuple(out)

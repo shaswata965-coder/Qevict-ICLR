@@ -300,12 +300,20 @@ def window_id_of(position: int, num_sink: int, window_size: int) -> int:
     """The chronological window id owning an original absolute ``position``.
 
     Windows are fixed chunks of the sequence and eviction never renumbers, so a
-    token's window id is a pure function of its original position (design §1,
-    §5): ``(position − num_sink) // window_size`` for post-sink tokens. This is
+    token's window id is a pure function of its original position:
+    ``(position − num_sink) // window_size`` for post-sink tokens. This is
     the single source of truth for the interleave order — it needs no separate
     id bookkeeping and is immune to score/state skew.
     """
     return (int(position) - num_sink) // window_size
+
+
+def _same_view(a: Tensor, b: Tensor) -> bool:
+    """``a`` and ``b`` are the same view of the same storage (an aliased value)."""
+    if a is b:
+        return True
+    return (a.data_ptr() == b.data_ptr() and a.shape == b.shape
+            and a.stride() == b.stride() and a.dtype == b.dtype)
 
 
 def compute_score_meta(
@@ -431,7 +439,12 @@ def materialize_effective_kv(
     # reorder to the scorer instead as a per-WINDOW permutation (~W entries, on
     # the [B, H, W] score axis) rather than a per-TOKEN one on the K/V tensors.
     eff_k = torch.cat([sink_k, body_k, k_q], dim=2)
-    eff_v = torch.cat([sink_v, body_v, v_q], dim=2)
+    # Aliased value (MLA, models/deepseek_v2/geometry.py): the value IS the key
+    # in both tiers, so the effective value is the effective key -- built once.
+    if _same_view(fp_values, fp_keys) and _same_view(v_q, k_q):
+        eff_v = eff_k
+    else:
+        eff_v = torch.cat([sink_v, body_v, v_q], dim=2)
 
     # Score-scatter map. Every window is wholly one tier, and within a tier the
     # windows are already ascending by id and window-size-aligned (fp body: the

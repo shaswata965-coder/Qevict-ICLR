@@ -34,7 +34,7 @@ CLI::
 
 Or via the single entry point::
 
-    python main.py --config configs/eval_tier_study.yaml
+    python main.py --config configs/llama/eval_tier_study.yaml
 """
 
 from __future__ import annotations
@@ -427,7 +427,7 @@ def run_study(
 
 
 class TierStudyRunner:
-    """``python main.py --config configs/eval_tier_study.yaml``.
+    """``python main.py --config configs/llama/eval_tier_study.yaml``.
 
     Reads the five npz paths from the ``tier_study:`` config section and writes
     under ``telemetry.output_dir/tier_study`` (or ``output_path``).  Analysis
@@ -444,7 +444,7 @@ class TierStudyRunner:
         if ts is None:
             raise ValueError(
                 "config has no `tier_study:` section — it needs r0_npz … r4_npz "
-                "(see configs/eval_tier_study.yaml).")
+                "(see configs/llama/eval_tier_study.yaml).")
         paths = {cid: getattr(ts, f"{cid.lower()}_npz", "")
                  for cid in CONDITION_IDS}
         missing = [c for c, p in paths.items() if not p]

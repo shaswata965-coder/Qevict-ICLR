@@ -30,3 +30,6 @@ data/pg19/
 .triton/
 
 data/gsm8k_cot/
+data/longgenbench/
+# third-party checkouts (scripts/run_longbench_deepseek_v2_lite_batched.sh)
+third_party/

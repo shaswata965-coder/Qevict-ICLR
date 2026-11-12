@@ -21,6 +21,8 @@ __all__ = [
     "ConfigValidationError",
     "get_cache_classes",
     "quant_budget_mode_kwargs",
+    "quant_tier_policy_kwargs",
+    "quant_tier_policy_record",
     "validate_backend_attn_pairing",
     "assert_transformers_version_supported",
     "is_transformers_version_supported",
@@ -169,6 +171,65 @@ def validate_backend_attn_pairing(
             f"attn_implementation in {allowed!r}, but got "
             f"{attn_implementation!r}.  Fix your config."
         )
+
+
+def quant_card_bits_record(cache_cfg: Any) -> dict:
+    """``{"mu": 4, "v": 8, "t": 8, "vm": 4}`` -- the gate-card widths a run used.
+
+    For metadata sidecars, next to ``read_gate``: the widths move the card's
+    price, and under ``quant_budget_mode: bytes`` which windows the cache
+    keeps, so a quality number without them does not say which card it ran.
+    Parsed from the config exactly as ``WindowedCacheConfig`` parses it, so a
+    ``null`` records the shipped default rather than ``None``.
+    """
+    from modules.quant.sketch import parse_card_bits
+    return parse_card_bits(getattr(cache_cfg, "quant_card_bits", None))._asdict()
+
+
+def quant_tier_policy_kwargs(cache_cfg: Any) -> dict:
+    """``quant_promotion`` / ``quant_promote_source`` for a WindowedCacheConfig.
+
+    Passed only when they differ from the shipped method, so a default run
+    constructs its cache exactly as before these knobs existed. Every runner
+    that builds a cache goes through here -- a knob threaded by hand into some
+    runners and not others is how ``quant_budget_mode`` came to be inert in
+    three of them.
+    """
+    out = {}
+    promo = getattr(cache_cfg, "quant_promotion", "bidir") or "bidir"
+    src = getattr(cache_cfg, "quant_promote_source", "dequant") or "dequant"
+    if promo != "bidir":
+        out["quant_promotion"] = promo
+    if src != "dequant":
+        out["quant_promote_source"] = src
+    # The completion-term ablation rides the same seam, for the same reason:
+    # passed only when set, so a default run builds its cache exactly as before.
+    from utils.completion_spec import from_config
+    spec = from_config(cache_cfg)
+    if spec is not None:
+        out.update(quant_completion=spec.mode, quant_completion_scale=spec.scale,
+                   quant_completion_sigma=spec.sigma, quant_completion_seed=spec.seed,
+                   quant_completion_scores=spec.scores)
+    return out
+
+
+def quant_tier_policy_record(cache_cfg: Any) -> dict:
+    """``{"quant_promotion": ..., "quant_promote_source": ...}`` for sidecars.
+
+    Next to ``read_gate`` and ``quant_card_bits``: either knob changes which
+    windows the cache keeps or what a promoted one holds, so a quality number
+    without them does not say which method produced it.
+    """
+    from utils.completion_spec import completion_record, from_config
+    return {
+        "quant_promotion": getattr(cache_cfg, "quant_promotion", "bidir") or "bidir",
+        "quant_promote_source": (getattr(cache_cfg, "quant_promote_source",
+                                         "dequant") or "dequant"),
+        # mode "native" = the shipped kernel path. Anything else is an ablation
+        # arm; the sidecar's read_gate.completion_applied must then equal
+        # read_gate.gated, which proves the epilogue ran on every gated layer.
+        "quant_completion": completion_record(from_config(cache_cfg)),
+    }
 
 
 def quant_gate_ratio_kwargs(cache_config_cls: Type, requested: float) -> dict:

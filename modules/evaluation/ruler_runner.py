@@ -109,6 +109,7 @@ class RulerRunner:
     def _load_model_and_tokenizer(self) -> Tuple:
         """Load model and tokenizer (lazy, called once)."""
         from transformers import AutoModelForCausalLM, AutoTokenizer
+        from utils.model_loading import load_causal_lm, load_tokenizer
 
         cfg = self.config
 
@@ -120,7 +121,7 @@ class RulerRunner:
         model_dtype = dtypes.get(cfg.model.dtype, torch.float16)
 
         log.info("Loading tokenizer: %s", cfg.model.name)
-        tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer = load_tokenizer(
             cfg.model.name,
             revision=getattr(cfg.model, "revision", None),
         )
@@ -133,7 +134,7 @@ class RulerRunner:
             cfg.model.dtype,
             cfg.model.attn_implementation,
         )
-        model = AutoModelForCausalLM.from_pretrained(
+        model = load_causal_lm(
             cfg.model.name,
             revision=getattr(cfg.model, "revision", None),
             torch_dtype=model_dtype,
@@ -394,7 +395,8 @@ class RulerRunner:
     def _setup_windowed_cache(self, input_ids: torch.Tensor, max_gen_len: int):
         """Create windowed cache and install hooks (identical to LongBenchRunner)."""
         from utils.cache_factory import (quant_budget_mode_kwargs,
-                                 quant_gate_ratio_kwargs)
+                                         quant_gate_ratio_kwargs,
+                                         quant_tier_policy_kwargs)
 
         cfg = self.config
         model = self.model
@@ -422,6 +424,9 @@ class RulerRunner:
             **quant_gate_ratio_kwargs(
                 self.WindowedCacheConfig,
                 getattr(cfg.cache, "quant_gate_ratio", 0.25)),
+            # Gate-card field widths (sketch.CardBits); None means the shipped card.
+            quant_card_bits=getattr(cfg.cache, "quant_card_bits", None),
+            **quant_tier_policy_kwargs(cfg.cache),
             first_eviction_step=getattr(cfg.cache, "first_eviction_step", FIRST_EVICTION_STEP_DEFAULT),
         )
 
@@ -581,8 +586,12 @@ class RulerRunner:
         budget = cfg.cache.cache_budget
         compression_ratio = round(1.0 - budget, 2) if budget else None
 
+        from utils.cache_factory import (quant_card_bits_record,
+                                         quant_tier_policy_record)
         meta = {
             "read_gate": self._read_gate_report(task_name),
+            "quant_card_bits": quant_card_bits_record(cfg.cache),
+            **quant_tier_policy_record(cfg.cache),
             "task": task_name,
             "data_dir": self.ruler.data_dir,
             "num_examples": num_examples,

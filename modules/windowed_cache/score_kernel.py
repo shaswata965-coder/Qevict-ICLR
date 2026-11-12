@@ -52,7 +52,7 @@ runs the fused kernel or RAISES — there is no PyTorch prefill fallback, becaus
 that path materialises a ``[B, H_q, chunk, S]`` probability block (~8.6 GB fp16
 at prefill=4096, batch=32) that OOMs the batched long-context shapes this method
 exists to serve, and a silent degrade to it is worse than a hard failure. Decode
-(``T == 1``) uses the PyTorch path (no grid to tile — design §6).
+(``T == 1``) uses the PyTorch path (no grid to tile).
 """
 
 from __future__ import annotations
@@ -535,7 +535,7 @@ def _token_scores_triton(
     # byte-for-byte the same shape of work; only the transcendental changes.
     #
     # ALWAYS. This read `_score_exp2_enabled()`, which went with
-    # STICKYKV_SCORE_EXP2 in 0974687 while the call site stayed -- so every
+    # the RECOVERKV_SCORE_EXP2 knob while the call site stayed -- so every
     # prefill on CUDA raised NameError, and nothing on a CPU box could see it
     # because this function refuses non-CUDA tensors two lines above. The knob's
     # default was on, so the behaviour is on; `USE_EXP2` remains a kernel
@@ -554,7 +554,7 @@ def _token_scores_triton(
     # BLOCK_N is chosen by the autotuner, so the grid must read it from the
     # winning config's meta at launch (Triton evaluates this lambda per config).
     # The fixed-tile launch that used to sit behind an `if True: … else:` here is
-    # gone with STICKYKV_SCORE_AUTOTUNE: it was unreachable, and it took
+    # gone with RECOVERKV_SCORE_AUTOTUNE: it was unreachable, and it took
     # `block_m`/`block_n` with it -- a caller passing them was pinning a tile
     # that production had already stopped reading.
     grid = lambda meta: (triton.cdiv(S, meta["BLOCK_N"]), B * H_q)
@@ -627,7 +627,7 @@ def compute_token_scores(
             )
         if lse is None:
             # L was not handed down from the forward
-            # (STICKYKV_SCORE_LSE_FROM_FORWARD off): recompute it. NOTE this
+            # (RECOVERKV_SCORE_LSE_FROM_FORWARD off): recompute it. NOTE this
             # still materialises a chunked logit block; feed `lse` from flash's
             # softmax_lse to make Stage B a single extra q·kᵀ pass with no such
             # transient.

@@ -122,8 +122,7 @@ def _evict_widths(masks, bounds):
 
     It did not matter much under ``quant_budget_mode: tokens``, where ``n_q`` is
     64. Under ``bytes`` -- the mode the budget is honestly spent in -- ``n_q`` is
-    **250**. Fitting DECODE_SPEED_PLAN.md §3's measured eviction cost against
-    the 2026-09-17 table reproduces every cell to within 2-13% only if the
+    **250**. Fitting the measured eviction cost against the decode table reproduces every cell to within 2-13% only if the
     eviction scales with ``n_q``, and it puts the eviction at **~60 ms of a
     124 ms step** at 4096/B=32. About half. This width is now the largest single
     item in the decode step, not a tidy-up.
@@ -323,9 +322,12 @@ class _ReadOnlySlotTableView(QuantSlotTable):
         self.window_size = parent.window_size
         self.head_dim = parent.head_dim
         self.num_kv_heads = parent.num_kv_heads
+        self.value_alias = getattr(parent, "value_alias", False)
         for field in ("key_codes", "val_codes", *GRID_FIELDS,
                       "slot_wid", "slot_active", "slot_pos"):
-            setattr(self, field, getattr(parent, field)[r0:r0 + rows])
+            t = getattr(parent, field)
+            # An aliased (MLA) table holds no value columns; they stay None.
+            setattr(self, field, None if t is None else t[r0:r0 + rows])
         self._row_base = (
             torch.arange(rows, device=parent.slot_wid.device) * parent.n_slots
         ).unsqueeze(1)
@@ -712,11 +714,11 @@ quiet uncompiled run would report uncompiled numbers as if compiled. So this rai
 than falling back.
   THERE IS NO WAY TO TURN IT OFF. Compilation is unconditional (see the banner
 at the top of this module): `_evict_two_tier` always calls the compiled body, on
-every backend and every device. `STICKYKV_COMPILE_EVICT`, `--compile-evict` and
-`STICKYKV_COMPILE_EVICT_BACKEND` were deleted in 0974687 ("one production path,
-no fallbacks") and this text used to still advertise all three -- so a failure
+every backend and every device. `RECOVERKV_COMPILE_EVICT`, `--compile-evict` and
+`RECOVERKV_COMPILE_EVICT_BACKEND` were deleted ("one production path, no
+fallbacks") and this text used to still advertise all three -- so a failure
 here sent you after knobs that no longer exist. This module reads NO environment
-variable. `perf_runner` still SETS `STICKYKV_COMPILE_EVICT=1`, which nothing
+variable. `perf_runner` still SETS `RECOVERKV_COMPILE_EVICT=1`, which nothing
 reads; it records intent, it does not control anything. A lowering failure is
 therefore a total outage until it is fixed, which is why the diagnosis below is
 the only path forward.
@@ -729,7 +731,7 @@ the identical symbolic error). The message recorded below is the SECOND attempt'
   The known causes are addressed at the source, and each has a named home:
     * `The argument '((I)//8)' is not comparable` -- a `torch.cat` in this graph.
       READ THIS BEFORE TOUCHING A `.shape` READ: it is NOT a symbolic-shape bug,
-      and two rounds of forcing `int()` on shape reads (`d44baba`, `014c40b`)
+      and two rounds of forcing `int()` on shape reads
       changed nothing because of that. `I` is not the imaginary unit and not a
       shape symbol -- it is `torch.utils._sympy.functions.Identity`, Inductor's
       "do not expand this" wrapper, which prints as `I` only because sympy's
@@ -986,7 +988,7 @@ def _announce_evict_path_once(compiled: bool) -> None:
     else:
         print(
             "[RecoverKV] eviction path: uncompiled two-tier eviction "
-            "(STICKYKV_COMPILE_EVICT off)",
+            "(RECOVERKV_COMPILE_EVICT off)",
             flush=True,
         )
 
@@ -997,7 +999,9 @@ class WindowedCache(_HFCacheBase):
     Supports ``B > 1`` at any ``quant_ratio``, for **equal-length** prompts.
     Rows evict divergently — each ranks its own windows — but the tier split
     keeps the same *count* per row, so both tiers stay dense and rectangular.
-    Ragged / left-padded batches are not implemented, at either tier.
+    Ragged / left-padded batches are not implemented, at either tier. On
+    DeepSeek-V2, a left-padded batch runs as one cache per row
+    (``models/deepseek_v2/row_batch.py``).
 
     Parameters
     ----------
@@ -1039,6 +1043,28 @@ class WindowedCache(_HFCacheBase):
                 # interface, so skipping the base init is safe.
                 pass
 
+        # A raw DeepSeek-V2 config describes the decompressed per-head path; the
+        # cache holds the MLA latent. Convert at this boundary, explicitly, so
+        # every runner that hands the cache `model.config` and the model's
+        # rotary module gets the latent view (one KV head of width Dc+Dr whose
+        # value aliases its key) and the packed RoPE adapter -- and `resolve()`
+        # keeps refusing a raw one, so nothing can price it by accident.
+        if (getattr(model_config, "model_type", None) == "deepseek_v2"
+                and not getattr(model_config, "mla_latent", False)):
+            from models.deepseek_v2.geometry import MLAGeometry
+            from models.deepseek_v2.rope import PackedRope
+            _geo = MLAGeometry.from_config(model_config)
+            model_config = _geo.cache_config()
+            if not isinstance(rope_module, PackedRope):
+                rope_module = PackedRope(rope_module, _geo)
+        if getattr(model_config, "mla_latent", False):
+            from models.deepseek_v2.rope import PackedRope
+            if not isinstance(rope_module, PackedRope):
+                raise ValueError(
+                    "an MLA latent cache needs the packed RoPE adapter "
+                    "(models.deepseek_v2.rope.PackedRope): the model's own rotary "
+                    "module rotates a 64-wide key, not the 576-wide packed one.")
+
         self.config = config
         self.resolved = config.resolve(prefill_len, model_config, kv_dtype, max_tokens)
         # Kept for the fused path's RoPE tables, which must be built at the STORE's
@@ -1062,6 +1088,25 @@ class WindowedCache(_HFCacheBase):
         # every path below is byte-identical to the single-tier fp16 cache.
         self._q: float = self.resolved.quant_ratio
         self._stores: List[Optional[QuantizedStore]] = [None] * num_layers
+        # MLA (models/deepseek_v2/geometry.py): the model config is a latent
+        # view -- one KV head of width Dc+Dr whose value IS its latent dims. The
+        # fp tier then stores one tensor and the int2 tier one set of codes.
+        # False for every other model, where every path below is unchanged.
+        self._value_alias: bool = bool(getattr(model_config, "kv_value_alias", False))
+        # The packed layout's per-half split (latent lanes, RoPE lanes), which
+        # the fused MLA kernel tiles by (mla_decode_kernel). None off MLA.
+        # A view without the dims (a unit-test stand-in) leaves it None, and the
+        # MLA kernel then refuses the tier rather than guess the split.
+        _lat = getattr(model_config, "latent_dim", None)
+        _rop = getattr(model_config, "rope_dim", None)
+        self._mla_split = ((int(_lat) // 2, int(_rop) // 2)
+                           if self._value_alias and _lat is not None
+                           and _rop is not None else None)
+        # The softmax scale, when the model states it. DeepSeek-V2's is
+        # `q_head_dim**-0.5 * mscale**2` (0.11472), which no head dim of this
+        # cache produces (576**-0.5 is 2.75x too small). Llama/Qwen configs do
+        # not set it, so they keep `head_dim**-0.5` exactly as before.
+        _stated_scale = getattr(model_config, "attn_softmax_scale", None)
         if self._q > 0.0:
             num_kv_heads = getattr(
                 model_config, "num_key_value_heads",
@@ -1084,11 +1129,18 @@ class WindowedCache(_HFCacheBase):
                     # size at the first update() (see _resolve_memoization).
                     memoize_read=self.resolved.quant_memoize_read is not False,
                     sketch_enabled=self.resolved.quant_sketch_enabled,
+                    card_bits=self.resolved.quant_card_bits,
+                    # The promotion-payload oracle keeps each window's original
+                    # fp K/V beside its codes; off unless asked for.
+                    shadow_dtype=(kv_dtype if self.resolved.quant_promote_source
+                                  == "original" else None),
+                    value_alias=self._value_alias,
                 )
                 for _ in range(num_layers)
             ]
             # Softmax scale for the fused decode kernel (Llama/Qwen: head_dim**-0.5).
-            self._attn_scaling: float = head_dim ** -0.5
+            self._attn_scaling: float = (head_dim ** -0.5 if _stated_scale is None
+                                         else float(_stated_scale))
         else:
             self._attn_scaling = 1.0
         self._memoization_resolved = False
@@ -1134,7 +1186,8 @@ class WindowedCache(_HFCacheBase):
             r.window_size, r.first_eviction_step + 1
         )
         self._states: List[CacheState] = [
-            CacheState(capacity=steady, prefill_capacity=prefill_cap)
+            CacheState(capacity=steady, prefill_capacity=prefill_cap,
+                       value_alias=self._value_alias)
             for _ in range(num_layers)
         ]
         self._policies: List[EvictionPolicy] = [
@@ -1243,6 +1296,27 @@ class WindowedCache(_HFCacheBase):
         if store is None:
             return t_fp
         return t_fp + store.num_active_tokens
+
+    def get_max_cache_shape(self) -> Optional[int]:
+        """``None`` -- no static max. transformers 4.47's base raises here.
+
+        ``Cache.get_usable_length`` calls it, and DeepSeek-V2's remote model
+        forward calls ``get_usable_length`` every step. Llama's path never does.
+        """
+        return None
+
+    @property
+    def _seen_tokens(self) -> int:
+        """Absolute tokens appended -- what ``Cache.seen_tokens`` reports.
+
+        DeepSeek-V2's remote ``prepare_inputs_for_generation`` slices the prompt
+        with ``past_key_values.seen_tokens`` (``past_length``). For an evicting
+        cache that must be the MONOTONIC count, never the held key count
+        (``get_seq_length``), or ``generate()`` would re-feed tokens the cache
+        has already seen. Read-only: it is ``_tokens_seen``, which ``update``
+        advances.
+        """
+        return self._tokens_seen
 
     def get_max_length(self) -> Optional[int]:
         """Return ``None`` — windowed cache doesn't have a static max."""
@@ -1682,6 +1756,16 @@ class WindowedCache(_HFCacheBase):
                 self._last_score_meta[layer_idx] = None
                 return state.key_states, state.value_states
 
+            if (getattr(self.resolved, "quant_completion", None) is not None
+                    and store is not None and store.num_active_windows > 0 and not is_prefill):
+                # Kernel-or-error: the completion ablation lives in the fused flash
+                # decode (flash_decode._run_fused). Materializing the tier here would
+                # run the shipped completion under the ablation's name.
+                raise RuntimeError(
+                    "quant_completion is set, but this decode step took the "
+                    "materialize path, which has no completion epilogue (a CPU "
+                    "run, or the fused flash decode is off). The ablation only "
+                    "exists on the fused flash path; it would be inert here.")
             eff_k, eff_v, score_meta = self._materialize(layer_idx)
             # Hand the effective K + its score-scatter map to the score hook
             # (fix #2) so it need not rebuild them. Overwritten each step; the
@@ -1731,10 +1815,10 @@ class WindowedCache(_HFCacheBase):
                 f"this model is sharded across {sorted(str(d) for d in devices)} "
                 "(device_map=\"auto\" splits by layer). Either pin the model to a "
                 "single GPU (CUDA_VISIBLE_DEVICES=0, which scripts/run_perf_table.sh "
-                "already defaults to) or set STICKYKV_LAYER_MAJOR_DECODE=0 to run "
+                "already defaults to) or set RECOVERKV_LAYER_MAJOR_DECODE=0 to run "
                 "the per-layer eviction, which produces byte-identical results at "
                 "the pre-optimisation launch count. Per-device grouping is the "
-                "proper fix and is not implemented yet -- see DECODE_SPEED_PLAN.md."
+                "proper fix and is not implemented yet."
             )
         B = self._states[0].key_states.shape[0]
         self._joint = CacheState.join_layers(self._states, self._steady_capacity)
@@ -1755,7 +1839,7 @@ class WindowedCache(_HFCacheBase):
         self._joint_qtier_memo = None
         # Every layer advanced its own counter identically; adopt it as the one
         # global step, and keep the per-layer list in sync for the readers that
-        # still index it (ours_parity_runner, demo_generate).
+        # still index it (ours_parity_runner).
         self._joint_step = self._generation_step[0]
         self._layers_opened = 0
         self._evicted_this_step = 0
@@ -1859,7 +1943,7 @@ class WindowedCache(_HFCacheBase):
                 "so scores must describe the store as it stands now — i.e. the "
                 "key set the previous step's attention saw. A width sized for "
                 "the post-append store belongs to the per-layer ordering "
-                "(STICKYKV_LAYER_MAJOR_DECODE=0)."
+                "(RECOVERKV_LAYER_MAJOR_DECODE=0)."
             )
 
     def _accumulate_joint_scores(self, new_window_scores: Tensor) -> None:
@@ -2082,6 +2166,16 @@ class WindowedCache(_HFCacheBase):
             self._last_score_meta[layer_idx] = None
             return k_layer, v_layer
 
+        if (getattr(self.resolved, "quant_completion", None) is not None
+                and store is not None and store.num_active_windows > 0):
+            # Kernel-or-error: the completion ablation lives in the fused flash
+            # decode (flash_decode._run_fused). Materializing the tier here would
+            # run the shipped completion under the ablation's name.
+            raise RuntimeError(
+                "quant_completion is set, but this decode step took the "
+                "materialize path, which has no completion epilogue (a CPU "
+                "run, or the fused flash decode is off). The ablation only "
+                "exists on the fused flash path; it would be inert here.")
         eff_k, eff_v, score_meta = self._materialize_joint(layer_idx, B)
         self._last_effective_k[layer_idx] = eff_k
         self._last_score_meta[layer_idx] = score_meta
@@ -2110,8 +2204,13 @@ class WindowedCache(_HFCacheBase):
         def by_layer(t: Tensor) -> Tensor:
             return t.reshape(L, B, n, *t.shape[1:])
 
-        kc, vc = by_layer(kc), by_layer(vc)
-        ks, kz, vs, vz = (g.map(by_layer) for g in (ks, kz, vs, vz))
+        # An aliased (MLA) store has no value fields; the kernel reads V from
+        # the dequantized key tile (`value_alias` in the qtier hand-off).
+        kc = by_layer(kc)
+        ks, kz = (g.map(by_layer) for g in (ks, kz))
+        if vc is not None:
+            vc = by_layer(vc)
+            vs, vz = (g.map(by_layer) for g in (vs, vz))
         qpos_flat = qpos.reshape(L * B, n * ws)                 # [R, n*ws]
         # The KV store's dtype, NOT fp32: every other RoPE in this cache runs at
         # the store dtype (HF's own, and unrotate/rotate_key_window), so an fp32
@@ -2136,19 +2235,28 @@ class WindowedCache(_HFCacheBase):
                 "qtier": {
                     "k_codes": kc[i], "k_scale": ks.map(lambda t: t[i]),
                     "k_zero": kz.map(lambda t: t[i]),
-                    "v_codes": vc[i], "v_scale": vs.map(lambda t: t[i]),
-                    "v_zero": vz.map(lambda t: t[i]),
+                    "v_codes": None if vc is None else vc[i],
+                    "v_scale": None if vc is None else vs.map(lambda t: t[i]),
+                    "v_zero": None if vc is None else vz.map(lambda t: t[i]),
                     "cos": cos_h[r0:r0 + B], "sin": sin_h[r0:r0 + B],
                     "window_size": ws,
+                    "value_alias": vc is None,
+                    "mla_split": self._mla_split,
                 },
                 "qpos": qpos_flat[r0:r0 + B],
                 "mkey": None, "score_meta": None,
+                # `**joint_gate` first, then override only the row-sliced
+                # tensors: every non-tensor key (`n_sel`, `bits`, and whatever
+                # _gate_ctx grows next) passes through. Listing keys by hand
+                # dropped `bits` here while the per-layer path carried it, and
+                # _run_fused died on every layer-major decode.
                 "gate": None if joint_gate is None else {
-                    "card": tuple(t[r0:r0 + B] for t in joint_gate["card"]),
+                    **joint_gate,
+                    "card": tuple(None if t is None else t[r0:r0 + B]
+                                  for t in joint_gate["card"]),
                     "anchor": joint_gate["anchor"][r0:r0 + B],
                     "centroid": tuple(t[r0:r0 + B]
                                       for t in joint_gate["centroid"]),
-                    "n_sel": joint_gate["n_sel"],
                 },
             }
 
@@ -2234,7 +2342,7 @@ class WindowedCache(_HFCacheBase):
     def _fused_qtier(self, layer_idx: int, store, B: int, n: int, ws: int) -> Dict:
         """The kernel's Q-tier context — gathered int2 fields + RoPE halves.
 
-        **Rebuilt only when the Q tier changes.** design §10 makes every entry
+        **Rebuilt only when the Q tier changes.** Every entry is
         write-once and moves the active set only at eviction, so between
         evictions the gathered codes/scales/zeros, the frozen positions, and the
         ``cos``/``sin`` those positions produce are all constant — the same
@@ -2268,8 +2376,11 @@ class WindowedCache(_HFCacheBase):
         def by_row(t: Tensor) -> Tensor:
             return t.reshape(B, n, *t.shape[1:])
 
-        kc, vc = by_row(kc), by_row(vc)
-        ks, kz, vs, vz = (g.map(by_row) for g in (ks, kz, vs, vz))
+        kc = by_row(kc)
+        ks, kz = (g.map(by_row) for g in (ks, kz))
+        if vc is not None:                    # absent on an aliased (MLA) store
+            vc = by_row(vc)
+            vs, vz = (g.map(by_row) for g in (vs, vz))
         qpos_flat = qpos.reshape(B, n * ws)
         # The KV store's dtype, NOT fp32: every other RoPE in this cache runs at
         # the store dtype (HF's own, and unrotate/rotate_key_window), so an fp32
@@ -2281,6 +2392,8 @@ class WindowedCache(_HFCacheBase):
             "k_codes": kc, "k_scale": ks, "k_zero": kz,
             "v_codes": vc, "v_scale": vs, "v_zero": vz,
             "cos": cos_h, "sin": sin_h, "window_size": ws,
+            "value_alias": vc is None,
+            "mla_split": self._mla_split,
         }
         # A new Q tier invalidates the scatter map built against the old one.
         self._fused_ctx[layer_idx] = {
@@ -2320,10 +2433,22 @@ class WindowedCache(_HFCacheBase):
         # skips cost no second pass over the tier to attend through. `vm_q` /
         # `vm_s` are SKETCH_FIELDS[-2:]; the kernel wants them contiguous and
         # separate from the scan fields, which the gather already gives.
+        # `bits` travels with the card because the card cannot say how it was
+        # encoded: a packed field's shape does not determine its width once `D`
+        # is not known, and both kernels take the widths as constexprs.
+        # Aliased value (MLA): the centroid IS the key mean `mu` (vbar over the
+        # latent dims, `sketch.value_centroid`), stored at `mu`'s width -- which
+        # `resolve()` forces `vm` to equal -- against the key anchor. Handing the
+        # kernel `mu`'s columns as the centroid makes its centroid path compute
+        # exactly `value_centroid`, with no second copy of the field.
+        alias = getattr(store, "value_alias", False)
+        centroid = ((card[0], card[1], store._anchor) if alias
+                    else (card[-2], card[-1], store._v_anchor))
         return {
             "card": card,
             "anchor": store._anchor,
-            "centroid": (card[-2], card[-1], store._v_anchor),
+            "centroid": centroid,
+            "bits": store.card_bits,
             "n_sel": max(1, math.ceil(ratio * n)),
         }
 
@@ -2366,7 +2491,7 @@ class WindowedCache(_HFCacheBase):
         """Build the ``[sink ‖ body ‖ Q]`` effective K/V for one layer.
 
         Returns ``(eff_k, eff_v, score_meta)`` — freshly-built tensors (callers
-        must not assume they alias the stored fp cache, design §9) plus the
+        must not assume they alias the stored fp cache) plus the
         score-scatter map the hook needs, or ``score_meta=None`` at an empty Q
         tier (the fp store, byte-identical).
 
@@ -2407,8 +2532,8 @@ class WindowedCache(_HFCacheBase):
         ``[L*B, n_q, H_kv, ws, D]`` tensor of which most lanes are masked away.
 
         **D1's size is entirely this ratio, and nothing has ever printed it.**
-        DECODE_NEXT.md §7 lists it as the risk the estimate rests on: *"If the
-        real count is routinely close to n_q, D1 is worth little."* So measure
+        It is the risk the estimate rests on: if the real count is routinely
+        close to n_q, D1 is worth little. So measure
         before rewriting, especially now that the eviction actually fuses (the
         waste is pointwise work inside a fused kernel, not sixteen launches of
         it, which is a different and un-sized quantity).
@@ -2598,7 +2723,9 @@ class WindowedCache(_HFCacheBase):
             # of the graph so the two branches stay the same operation.
             state.replace(
                 join(state.key_states[:, :, :num_sink, :], new_k, 2),
-                join(state.value_states[:, :, :num_sink, :], new_v, 2),
+                # An aliased value (MLA) has no buffer and no body of its own.
+                (None if new_v is None
+                 else join(state.value_states[:, :, :num_sink, :], new_v, 2)),
                 join(state.position_ids[:, :num_sink], new_pos, 1),
             )
 
@@ -2723,12 +2850,12 @@ class WindowedCache(_HFCacheBase):
         # count below is a real int and the index math is concrete. The cache
         # compacts to the budget every ``ws`` steps, so this specializes to a
         # handful of shapes during the fill phase and is stable at steady state
-        # (which is why the compiled body is worth its recompiles — design §5).
+        # (which is why the compiled body is worth its recompiles).
         #
         # Read one dim at a time, NOT as ``B, H_kv, T_fp, D = ...shape``. An
         # unpack of the whole shape is the same symbolic read wearing a different
         # AST, and it is where the guard used to have a blind spot: the four
-        # ``int()``s ``014c40b`` added all went on ``x = t.shape[i]`` forms while
+        # ``int()``s added earlier all went on ``x = t.shape[i]`` forms while
         # the live offender — ``B, _, W = window_scores.shape`` in
         # ``policy.compute_two_tier_retain`` — was an unpack and sailed through.
         B = state.key_states.shape[0]
@@ -2744,7 +2871,17 @@ class WindowedCache(_HFCacheBase):
         n_q_prev = store.num_active_windows
 
         # --- 1–2. Rank + tier assignment on the merged axis -----------------
-        retained_idx, new_tier = policy.compute_two_tier_retain(state.window_scores)
+        # `quant_promotion="oneway"` (an ablation; the shipped policy is
+        # "bidir"): a window already in the int2 tier may not take an fp slot,
+        # so the chain is F -> Q -> E. That needs the CURRENT tier over the whole
+        # merged axis before ranking -- one extra lookup, only on this arm. The
+        # branch is a config string, a trace-time constant.
+        no_promote = None
+        if self.resolved.quant_promotion == "oneway":
+            store.ensure(B, device)
+            no_promote = store.lookup(state.original_window_ids)[1]
+        retained_idx, new_tier = policy.compute_two_tier_retain(
+            state.window_scores, no_promote)
         # W is a concrete int (above), so these are Python ints even under
         # torch.compile; the int() is belt-and-suspenders against a future
         # tier_counts that returns a tensor scalar.
@@ -2816,8 +2953,14 @@ class WindowedCache(_HFCacheBase):
             (min(self.resolved.N_q, n_fp), n_q, n_q),
         )
 
+        # MLA: the value aliases the key (`CacheState._value_alias`), so there
+        # is no value body to gather, splice or install -- `alias` is a config
+        # constant, so under Dynamo these branches fold away at trace time.
+        # Every KEY operation below, and therefore which windows are kept, which
+        # tier each lands in and every byte of the rebuilt store, is unchanged.
+        alias = self._value_alias
         body_k = state.key_states[:, :, num_sink:, :]
-        body_v = state.value_states[:, :, num_sink:, :]
+        body_v = None if alias else state.value_states[:, :, num_sink:, :]
         body_pos = state.position_ids[:, num_sink:]
         # Token → window id. Non-decreasing per row (the fp store is
         # [sink ‖ windows by ascending id] and generation appends the newest
@@ -2835,13 +2978,22 @@ class WindowedCache(_HFCacheBase):
         prom_slot, prom_valid = self._compact(fp_slot, fp_prom, p_max)
         prom_k = prom_v = prom_pos = None
         if p_max > 0:
-            k_pre, v_pre, pos_pre = store.promote_many(prom_slot, prom_valid, dtype)
-            prom_k = rotate_key_window(
-                k_pre.permute(0, 2, 1, 3, 4).reshape(B, H_kv, p_max * ws, D),
-                pos_pre.reshape(B, p_max * ws),
-                rope,
-            ).to(dtype)                                                # [B,H,p*ws,D]
-            prom_v = v_pre.to(dtype).permute(0, 2, 1, 3, 4).reshape(
+            if store.shadow_enabled:
+                # Evaluation-only oracle (`quant_promote_source="original"`):
+                # the window comes back exactly as it was demoted, keys already
+                # rotated, so there is no dequant and no RoPE here.
+                k_orig, v_pre, pos_pre = store.promote_many_original(
+                    prom_slot, prom_valid, dtype)
+                prom_k = k_orig.permute(0, 2, 1, 3, 4).reshape(
+                    B, H_kv, p_max * ws, D).to(dtype)                  # [B,H,p*ws,D]
+            else:
+                k_pre, v_pre, pos_pre = store.promote_many(prom_slot, prom_valid, dtype)
+                prom_k = rotate_key_window(
+                    k_pre.permute(0, 2, 1, 3, 4).reshape(B, H_kv, p_max * ws, D),
+                    pos_pre.reshape(B, p_max * ws),
+                    rope,
+                ).to(dtype)                                            # [B,H,p*ws,D]
+            prom_v = None if alias else v_pre.to(dtype).permute(0, 2, 1, 3, 4).reshape(
                 B, H_kv, p_max * ws, D)
             prom_pos = pos_pre.reshape(B, p_max * ws).to(body_pos.dtype)
 
@@ -2864,7 +3016,8 @@ class WindowedCache(_HFCacheBase):
             )
             idx_d = tok_f.unsqueeze(1).unsqueeze(-1).expand(B, H_kv, n_d * ws, D)
             k_post = torch.gather(body_k, 2, idx_d)
-            v_tok = torch.gather(body_v, 2, idx_d)
+            # Aliased: the store quantizes the key once and ignores `values`.
+            v_tok = k_post if alias else torch.gather(body_v, 2, idx_d)
             prange = torch.gather(body_pos, 1, tok_f)
             k_pre_d = unrotate_key_window(k_post, prange, rope)
             store.demote_many(
@@ -2878,7 +3031,7 @@ class WindowedCache(_HFCacheBase):
                 # for the window's whole life.
                 keys_post_rope=(
                     k_post.reshape(B, H_kv, n_d, ws, D).permute(0, 2, 1, 3, 4)
-                    if store.sketch_enabled else None
+                    if (store.sketch_enabled or store.shadow_enabled) else None
                 ),
             )
 
@@ -2920,20 +3073,21 @@ class WindowedCache(_HFCacheBase):
             torch.gather(start_of_rank, 1, jj) + off, max(T_body - 1, 0))
         idx_fp = src_fp.unsqueeze(1).unsqueeze(-1).expand(B, H_kv, new_body_len, D)
         new_k = torch.gather(body_k, 2, idx_fp)
-        new_v = torch.gather(body_v, 2, idx_fp)
+        new_v = None if alias else torch.gather(body_v, 2, idx_fp)
         new_pos = torch.gather(body_pos, 1, src_fp)
 
         if p_max > 0:
             # A promoted window has no tokens in the fp store — splice its
-            # freshly-rotated copy in at its chronological slot (design §5 step
-            # 3): same layout, different source.
+            # freshly-rotated copy in at its chronological slot: same layout,
+            # different source.
             tok_is_prom = torch.gather(fp_prom, 1, jj)                 # [B, T_new]
             src_pr = _clamp_index(
                 torch.gather(prom_rank, 1, jj) * ws + off, p_max * ws - 1)
             idx_pr = src_pr.unsqueeze(1).unsqueeze(-1).expand(B, H_kv, new_body_len, D)
             sel = tok_is_prom.unsqueeze(1).unsqueeze(-1)
             new_k = torch.where(sel, torch.gather(prom_k, 2, idx_pr), new_k)
-            new_v = torch.where(sel, torch.gather(prom_v, 2, idx_pr), new_v)
+            if not alias:
+                new_v = torch.where(sel, torch.gather(prom_v, 2, idx_pr), new_v)
             new_pos = torch.where(
                 tok_is_prom, torch.gather(prom_pos, 1, src_pr), new_pos
             )

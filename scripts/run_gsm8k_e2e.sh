@@ -13,6 +13,14 @@
 #   MODEL=/path/to/llama bash scripts/run_gsm8k_e2e.sh
 #   STAGE=score bash scripts/run_gsm8k_e2e.sh        # re-score, no generation
 #
+#   # DeepSeek-V2-Lite-Chat (latent FullKV baseline + the operating point):
+#   FAMILY=deepseek ARMS=budget20 BASELINE_MIN=60 bash scripts/run_gsm8k_e2e.sh
+#
+# FAMILY picks the config directory configs/<family>/ (llama | deepseek):
+# gsm8k_full_cache.yaml and gsm8k_<arm>.yaml for each arm in ARMS. Results go to
+# outputs/gsm8k (llama) or outputs/gsm8k_deepseek_v2_lite. The DeepSeek
+# BASELINE_MIN above is a sanity floor, not a reported number.
+#
 # The baseline is a HARD GATE: if it does not reach BASELINE_MIN accuracy the
 # script stops before running any budget, because a budget number is only
 # meaningful relative to a baseline that reproduces.
@@ -27,7 +35,15 @@ cd "$PROJECT_ROOT"
 
 PY="${PY:-python}"
 DATA_DIR="${DATA_DIR:-data/gsm8k_cot}"
-RESULTS_DIR="${RESULTS_DIR:-outputs/gsm8k}"
+FAMILY="${FAMILY:-llama}"
+CFG_DIR="configs/$FAMILY"
+[ -d "$CFG_DIR" ] || { echo "no config directory $CFG_DIR (FAMILY=llama|deepseek)" >&2; exit 2; }
+ARMS="${ARMS:-budget80 budget20}"
+case "$FAMILY" in               # the configs' own results_dir
+  llama)    RESULTS_DIR="${RESULTS_DIR:-outputs/gsm8k}" ;;
+  deepseek) RESULTS_DIR="${RESULTS_DIR:-outputs/gsm8k_deepseek_v2_lite}" ;;
+  *)        RESULTS_DIR="${RESULTS_DIR:-outputs/gsm8k_${FAMILY}}" ;;
+esac
 SAMPLES="${SAMPLES:-max}"
 MODEL="${MODEL:-}"
 STAGE="${STAGE:-all}"
@@ -55,7 +71,7 @@ run_one() {  # $1 = config basename, $2 = output subdir, $3 = human label
   banner "$label"
   mkdir -p "$RESULTS_DIR/$out"
   { git rev-parse HEAD 2>/dev/null || echo "no_git"; } > "$RESULTS_DIR/$out/run.env"
-  $PY main.py --config "configs/llama/$cfg" \
+  $PY main.py --config "$CFG_DIR/$cfg" \
       --override "${OVERRIDES[@]}" gsm8k.output_dir="$RESULTS_DIR/$out"
 }
 
@@ -83,8 +99,8 @@ for w in rep.warnings:
 fail = []
 if rep.accuracy < floor:
     fail.append(
-        f"accuracy {rep.accuracy:.2f} < {floor}. Llama-3.1-8B-Instruct scores "
-        f"~80-85 on GSM8K with chain-of-thought. A number near 13 means the "
+        f"accuracy {rep.accuracy:.2f} < {floor} (BASELINE_MIN). Llama-3.1-8B-"
+        f"Instruct scores ~80-85 on GSM8K with chain-of-thought. A number near 13 means the "
         f"prompt is not eliciting reasoning -- check that {run_dir}/meta.json "
         f"has prompt_style=chain_of_thought and dataset_max_new_tokens=512."
     )
@@ -110,20 +126,37 @@ fi
 # 3. The two budgets.
 # ---------------------------------------------------------------------------
 if [ "$STAGE" = "all" ] || [ "$STAGE" = "budgets" ]; then
-  run_one gsm8k_budget80.yaml budget80 "4/5  Cache budget 0.80 (compression_ratio 0.20)"
-  run_one gsm8k_budget20.yaml budget20 "4/5  Cache budget 0.20 (compression_ratio 0.80)"
+  for arm in $ARMS; do
+    run_one "gsm8k_${arm}.yaml" "$arm" "4/5  ${arm} ($CFG_DIR/gsm8k_${arm}.yaml)"
+  done
+fi
+
+# A budget arm's number is a gated number only if its sidecar says so. Checked
+# whenever the arms exist; reported, then turned into the exit status at the end
+# so the comparison below still prints.
+GATE_STATUS=0
+ARM_DIRS=()
+for arm in $ARMS; do ARM_DIRS+=("$RESULTS_DIR/$arm"); done
+if [ "$STAGE" != "baseline" ] && [ "$STAGE" != "data" ]; then
+  banner "Read-gate verdicts"
+  $PY scripts/check_read_gate.py "${ARM_DIRS[@]}" || GATE_STATUS=$?
 fi
 
 # ---------------------------------------------------------------------------
 # 4. Score everything and print the comparison table.
 # ---------------------------------------------------------------------------
 banner "5/5  Comparison"
+RUN_DIRS=("$RESULTS_DIR/full_cache")
+for arm in $ARMS; do RUN_DIRS+=("$RESULTS_DIR/$arm"); done
 $PY -m modules.evaluation.gsm8k_scoring \
-    --runs "$RESULTS_DIR/full_cache" "$RESULTS_DIR/budget80" "$RESULTS_DIR/budget20" \
+    --runs "${RUN_DIRS[@]}" \
     --out_csv "$RESULTS_DIR/comparison.csv"
 
 echo
 echo "Artifacts:"
-echo "  $RESULTS_DIR/{full_cache,budget80,budget20}/predictions.jsonl"
-echo "  $RESULTS_DIR/{full_cache,budget80,budget20}/meta.json"
+for d in "${RUN_DIRS[@]}"; do echo "  $d/{predictions.jsonl,meta.json}"; done
 echo "  $RESULTS_DIR/comparison.csv"
+if [ "$GATE_STATUS" -ne 0 ]; then
+  echo "!! at least one budget arm's sidecar does not prove a gated run (see above)."
+fi
+exit "$GATE_STATUS"

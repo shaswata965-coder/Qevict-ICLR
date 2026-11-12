@@ -5,12 +5,14 @@
 A YAML config names the suite to run (``run.mode``) and everything it needs.
 This file maps that mode to its runner (``SUITES`` below), loads the config,
 applies the overrides, seeds everything and runs. It holds no experiment logic.
-Every script in ``scripts/`` is a thin wrapper around this command.
+The scripts in ``scripts/`` wrap this command; the exceptions run their own
+module (the batched DeepSeek LongBench harness, the observation collector, the
+LongGenBench judge) and say so in their headers.
 
 Suites (``run.mode`` -> config -> what it produces)
 --------------------------------------------------
 Accuracy
-  longbench        configs/{llama,mistral}/longbench_{full_cache,ours_flash_attn}.yaml
+  longbench        configs/{llama,mistral,deepseek}/longbench_{full_cache,ours_flash_attn}.yaml
                    16 English LongBench datasets -> outputs/longbench/<run>/<dataset>.jsonl
   longbench_score  any LongBench config + --override run.mode=longbench_score
                    scores every run under outputs/longbench/ -> <run>/scores.csv, comparison.csv
@@ -18,8 +20,12 @@ Accuracy
                    13 RULER tasks at one context length -> outputs/ruler/<run>/<task>.jsonl
   ruler_score      any RULER config + --override run.mode=ruler_score
   gsm8k            configs/llama/gsm8k_{full_cache,budget20,budget80}.yaml
+                   configs/deepseek/gsm8k_{full_cache,budget20}.yaml
                    8-shot chain-of-thought GSM8K -> outputs/gsm8k/<run>/predictions.jsonl
   gsm8k_score      any GSM8K config + --override run.mode=gsm8k_score
+  longgenbench     configs/llama/longgenbench_{full_cache,ours_flash_attn}.yaml
+                   LongGenBench-16K generation -> <output_dir>/generations.jsonl;
+                   judged and scored by longgenbench_eval (scripts/run_longgenbench.sh)
 
 Speed and memory
   perf             configs/llama/eval_perf.yaml          latency factorial, batch 1
@@ -38,10 +44,11 @@ Analysis (teacher-forced parity runs, then post-processing without a model)
 
 Changing the configuration
 --------------------------
-1. Pick the model by picking the config directory: ``configs/llama/`` or
-   ``configs/mistral/``. What differs between models (checkpoint, LongBench
-   truncation length, and the three attention-interface adaptations) is listed
-   in ``models/__init__.py``.
+1. Pick the model by picking the config directory: ``configs/llama/``,
+   ``configs/mistral/`` or ``configs/deepseek/``. What differs between models
+   (checkpoint, LongBench truncation length, the attention-interface
+   adaptations, and DeepSeek-V2's latent cache) is listed in
+   ``models/__init__.py``.
 2. Edit the YAML, or override any field from the command line with dotted keys.
    Values are parsed as int / float / bool / None / list, else string; lists
    use brackets. ``--override`` may be repeated; later values win.
@@ -71,7 +78,9 @@ Changing the configuration
                            flash_attention_2
 
    Values in brackets are the operating point every headline number uses
-   (``utils.config.OPERATING_POINT``). The parity and perf suites read the same
+   (``utils.config.OPERATING_POINT``). The ablation knobs
+   (``quant_card_bits``, ``quant_promotion``, ``quant_promote_source``,
+   ``quant_completion*``) are off at their defaults; see README.md. The parity and perf suites read the same
    geometry from the ``window:`` block, and the LongBench / RULER runners warn
    when ``cache.*`` and ``window.*`` disagree, so change both together.
 
@@ -103,6 +112,7 @@ SUITES: Dict[str, str] = {
     "ruler_score": "modules.evaluation.ruler_scoring.RulerScorer",
     "gsm8k": "modules.evaluation.gsm8k_runner.GSM8KRunner",
     "gsm8k_score": "modules.evaluation.gsm8k_scoring.GSM8KScorer",
+    "longgenbench": "modules.evaluation.longgenbench_runner.LongGenBenchRunner",
     # speed and memory
     "perf": "modules.evaluation.perf_runner.PerfRunner",
     # analysis

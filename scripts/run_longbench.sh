@@ -3,12 +3,13 @@
 #
 #   scripts/run_longbench.sh <model> <method> [--override key=value ...]
 #
-#   model   llama | mistral            -> configs/<model>/
+#   model   llama | mistral | deepseek -> configs/<model>/
 #   method  full_cache | ours_flash_attn
 #
 # Examples:
 #   scripts/run_longbench.sh llama full_cache
 #   scripts/run_longbench.sh mistral ours_flash_attn
+#   scripts/run_longbench.sh deepseek ours_flash_attn
 #   # one dataset (e.g. to spread datasets over GPUs), a 10% budget:
 #   CUDA_VISIBLE_DEVICES=3 scripts/run_longbench.sh llama ours_flash_attn \
 #       --override longbench.datasets=[qasper] cache.cache_budget=0.10 \
@@ -27,7 +28,7 @@ export PYTHONHASHSEED=0
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 
 if [[ $# -lt 2 ]]; then
-  sed -n '2,12p' "$0"; exit 2
+  sed -n '2,13p' "$0"; exit 2
 fi
 MODEL="$1"; METHOD="$2"; shift 2
 CONFIG="configs/$MODEL/longbench_$METHOD.yaml"

@@ -6,8 +6,7 @@ parity run.  Unlike the Suite-A Jaccard metrics in :mod:`utils.metrics` — whic
 are pure, fully-vectorised set ops — these are inherently *sequential* policy
 simulations (each flush's retain decision depends on the previous flush's
 retained set), so they live in their own module and use explicit loops.  Do not
-fold them back into ``utils/metrics.py``: ``test_faithfulness.py`` asserts that
-module is loop-free.
+fold them back into ``utils/metrics.py``, which is kept loop-free.
 
 Two quantities, both derived from one Sticky-K simulation over the truth masses:
 

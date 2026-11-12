@@ -88,6 +88,7 @@ class GSM8KRunner:
         self._n_no_eviction = 0
         self._retained_tokens: List[int] = []
         self._sequence_tokens: List[int] = []
+        self._int2_windows: List[int] = []
 
     # ------------------------------------------------------------------
     # setup
@@ -105,6 +106,7 @@ class GSM8KRunner:
 
     def _load_model_and_tokenizer(self) -> Tuple:
         from transformers import AutoModelForCausalLM, AutoTokenizer
+        from utils.model_loading import load_causal_lm, load_tokenizer
 
         cfg = self.config
         dtypes = {
@@ -115,7 +117,7 @@ class GSM8KRunner:
         model_dtype = dtypes.get(cfg.model.dtype, torch.float16)
 
         log.info("Loading tokenizer: %s", cfg.model.name)
-        tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer = load_tokenizer(
             cfg.model.name, revision=getattr(cfg.model, "revision", None)
         )
         if tokenizer.pad_token is None:
@@ -125,7 +127,7 @@ class GSM8KRunner:
             "Loading model: %s (dtype=%s, attn=%s)",
             cfg.model.name, cfg.model.dtype, cfg.model.attn_implementation,
         )
-        model = AutoModelForCausalLM.from_pretrained(
+        model = load_causal_lm(
             cfg.model.name,
             revision=getattr(cfg.model, "revision", None),
             torch_dtype=model_dtype,
@@ -302,12 +304,26 @@ class GSM8KRunner:
             "hit_token_cap": n_generated >= max_gen_len,
         }
         if resolved is not None:
-            retained = min(resolved.total_budget_tokens, seq_tokens)
-            evicted = resolved.total_budget_tokens < seq_tokens
+            # What the cache HOLDS, not what the budget nominally allows. The
+            # two differ in both directions: when sink + local exceed the budget
+            # the resolver clamps to zero evictable windows and keeps sink +
+            # local anyway (133 tokens at the operating point, against a ~131
+            # token budget on a median GSM8K prompt), and under 'bytes' an int2
+            # window is cheaper than an fp one, so the same bytes hold more
+            # tokens. `total_budget_tokens` describes neither.
+            capacity = resolved.retained_tokens
+            retained = min(capacity, seq_tokens)
+            evicted = capacity < seq_tokens
             stats["budget_tokens"] = resolved.total_budget_tokens
+            stats["retained_capacity_tokens"] = capacity
+            # How many int2 windows this example's cache could hold. Zero means
+            # the run had no int2 tier, and therefore no read gate, on this
+            # example, whatever quant_ratio says.
+            stats["int2_windows"] = resolved.N_q
             stats["evicted"] = evicted
             self._retained_tokens.append(retained)
             self._sequence_tokens.append(seq_tokens)
+            self._int2_windows.append(resolved.N_q)
             if not evicted:
                 self._n_no_eviction += 1
 
@@ -337,7 +353,8 @@ class GSM8KRunner:
     def _setup_windowed_cache(self, input_ids: torch.Tensor, max_gen_len: int):
         """Create windowed cache + hooks. Returns ``(cache, hooks, resolved)``."""
         from utils.cache_factory import (quant_budget_mode_kwargs,
-                                 quant_gate_ratio_kwargs)
+                                         quant_gate_ratio_kwargs,
+                                         quant_tier_policy_kwargs)
 
         cfg = self.config
         model = self.model
@@ -360,6 +377,9 @@ class GSM8KRunner:
             **quant_gate_ratio_kwargs(
                 self.WindowedCacheConfig,
                 getattr(cfg.cache, "quant_gate_ratio", 0.25)),
+            # Gate-card field widths (sketch.CardBits); None means the shipped card.
+            quant_card_bits=getattr(cfg.cache, "quant_card_bits", None),
+            **quant_tier_policy_kwargs(cfg.cache),
             first_eviction_step=getattr(cfg.cache, "first_eviction_step", FIRST_EVICTION_STEP_DEFAULT),
         )
 
@@ -389,13 +409,6 @@ class GSM8KRunner:
         kv_dtype = dtypes.get(cfg.model.dtype, torch.float16)
         prefill_len = int(input_ids.shape[-1])
 
-        resolved = cache_config.resolve(
-            prefill_len=prefill_len,
-            model_config=model.config,
-            kv_dtype=kv_dtype,
-            max_tokens=max_gen_len,
-        )
-
         cache = self.WindowedCache(
             config=cache_config,
             prefill_len=prefill_len,
@@ -405,6 +418,17 @@ class GSM8KRunner:
             num_layers=model.config.num_hidden_layers,
             max_tokens=max_gen_len,
         )
+        # The cache's OWN resolution, not a second `cache_config.resolve(...)`
+        # against `model.config`. They are the same call for Llama/Qwen (the
+        # cache resolves with exactly these arguments), but for DeepSeek-V2 the
+        # cache first converts the raw config to its MLA latent view (one KV
+        # head of width Dc+Dr whose value aliases its key) and `resolve()`
+        # REFUSES the raw one -- it would price 8,192 B/token against the
+        # latent's 1,152. Resolving it here by hand raised on the first example
+        # of every windowed DeepSeek GSM8K run, and reading the cache's copy is
+        # also the only way the compression diagnostic below can describe the
+        # cache that actually ran.
+        resolved = cache.resolved
         hooks = self.install_score_hooks(model, cache, cache_config)
         return cache, hooks, resolved
 
@@ -447,10 +471,16 @@ class GSM8KRunner:
                 "n_examples_no_eviction": None,
             }
         n = len(self._sequence_tokens)
+        n_int2 = sum(1 for w in self._int2_windows if w > 0)
         return {
             "compression_active": self._n_no_eviction < n,
             "n_examples_no_eviction": self._n_no_eviction,
             "pct_examples_no_eviction": round(100.0 * self._n_no_eviction / n, 2),
+            # Examples whose cache could hold at least one int2 window. The read
+            # gate exists only on those, so a `gated` read_gate verdict speaks
+            # for this fraction of the run and no more.
+            "n_examples_with_int2_tier": n_int2,
+            "pct_examples_with_int2_tier": round(100.0 * n_int2 / n, 2),
             "mean_sequence_tokens": round(sum(self._sequence_tokens) / n, 1),
             "mean_retained_tokens": round(sum(self._retained_tokens) / n, 1),
             "effective_retention": round(
@@ -475,6 +505,18 @@ class GSM8KRunner:
             s["effective_retention"], s["n_examples_no_eviction"],
             len(self._sequence_tokens), s["pct_examples_no_eviction"],
         )
+
+        q = float(getattr(self.config.cache, "quant_ratio", 0.0) or 0.0)
+        if q > 0.0 and s["pct_examples_with_int2_tier"] < 90.0:
+            log.warning(
+                "quant_ratio=%s, but only %d/%d examples (%.1f%%) had room for "
+                "an int2 window: on the rest the budget is spent on sink + local "
+                "before any evictable window can be bought, so the int2 tier, "
+                "promotion and the read gate never ran. A `gated` read_gate "
+                "verdict in meta.json speaks for the %.1f%% only.",
+                q, s["n_examples_with_int2_tier"], len(self._sequence_tokens),
+                s["pct_examples_with_int2_tier"], s["pct_examples_with_int2_tier"],
+            )
 
         if s["pct_examples_no_eviction"] > 10.0:
             log.warning(
@@ -503,8 +545,12 @@ class GSM8KRunner:
         cfg = self.config
         budget = cfg.cache.cache_budget
 
+        from utils.cache_factory import (quant_card_bits_record,
+                                         quant_tier_policy_record)
         meta = {
             "read_gate": self._read_gate_report("gsm8k"),
+            "quant_card_bits": quant_card_bits_record(cfg.cache),
+            **quant_tier_policy_record(cfg.cache),
             "task": "gsm8k",
             "run_name": output_dir.name,
             "num_examples": n_examples,
@@ -533,6 +579,8 @@ class GSM8KRunner:
             "num_sink_tokens": cfg.cache.num_sink_tokens,
             "local_window_size": cfg.cache.local_window_size,
             "quant_ratio": getattr(cfg.cache, "quant_ratio", 0.0),
+            "quant_budget_mode": getattr(cfg.cache, "quant_budget_mode", "bytes"),
+            "quant_gate_ratio": getattr(cfg.cache, "quant_gate_ratio", None),
             "first_eviction_step": getattr(cfg.cache, "first_eviction_step", FIRST_EVICTION_STEP_DEFAULT),
             "rerotate_on_evict": getattr(cfg.cache, "rerotate_on_evict", False),
             "stop_strings": STOP_STRINGS if self._supports_stop_strings() else None,

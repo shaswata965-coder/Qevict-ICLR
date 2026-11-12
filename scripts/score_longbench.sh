@@ -7,6 +7,7 @@
 # Writes <run>/scores.csv for every run directory, then
 #   outputs/longbench/comparison_llama.csv    full_cache         vs ours_*
 #   outputs/longbench/comparison_mistral.csv  mistral_full_cache vs mistral_ours_*
+#   outputs/longbench/comparison_deepseek.csv deepseek_v2_lite_full_cache vs deepseek_v2_lite_ours_*
 # (run directories are the longbench.output_dir values in configs/<model>/).
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
@@ -35,3 +36,4 @@ compare() {  # $1 = model tag, $2 = baseline dir, $3 = variant glob
 }
 compare llama full_cache "ours_*"
 compare mistral mistral_full_cache "mistral_ours_*"
+compare deepseek deepseek_v2_lite_full_cache "deepseek_v2_lite_ours_*"

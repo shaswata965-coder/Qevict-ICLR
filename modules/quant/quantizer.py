@@ -80,9 +80,15 @@ GRID_GROUP = 32
 # multi-millisecond kernels, because the break stops Inductor fusing the one part
 # of the eviction worth fusing.
 #
-# The lowering bug is fixed upstream (>= 2.7, the boundary the original
-# workaround named). But tracing this function is only SAFE under a second
-# condition, and it is the more important one:
+# The original workaround named >= 2.7 as the boundary where the lowering bug is
+# fixed. Not on the evidence: on torch 2.7.1 + CUDA (A100) the
+# eviction's compile stopped at decode step 0 with the same "StarDep does not
+# have an index" -- the log did not name the op, but this trace is the one
+# thing 2.7 added to that graph -- and 2.7.1's CPU backend fails differently
+# under emulate_precision_casts (`CppVecOverrides.to_dtype() got an unexpected
+# keyword argument 'use_compute_types'`). So 2.7 keeps the graph break, as 2.6
+# does; >= 2.8 is traced. Tracing this function is also only SAFE under a
+# second condition, and it is the more important one:
 #
 #   Inductor, by default, does not emulate intermediate precision casts. It
 #   drops an fp32 -> fp16 -> fp32 round trip and keeps the fp32 value in a
@@ -110,7 +116,7 @@ def _quant_may_be_traced() -> bool:
         major, minor = (int(p) for p in torch.__version__.split(".")[:2])
     except Exception:  # pragma: no cover - unparseable version string
         return False
-    if (major, minor) < (2, 7):  # pragma: no cover - torch-version dependent
+    if (major, minor) < (2, 8):  # pragma: no cover - torch-version dependent
         return False  # gather -> amin StarDep lowering failure
     try:
         from torch._inductor import config as _inductor_config
@@ -168,13 +174,22 @@ def grid_bytes_per_head(axis_len: int) -> int:
     return 2 * axis_len + 4 * (axis_len // grid_group(axis_len))
 
 
-def bytes_per_q_window(num_kv_heads: int, head_dim: int, window_size: int) -> int:
+def bytes_per_q_window(num_kv_heads: int, head_dim: int, window_size: int,
+                       value_alias: bool = False) -> int:
     """Bytes one int2 window costs: codes + both grids, **excluding its card**.
 
     The card is priced by :func:`modules.quant.sketch.sketch_bytes_per_head`;
     the caller adds it when the gate is live. At ``H=8, D=128, ws=8`` this is
     6432 B against the fp16 grid's 8448.
+
+    ``value_alias`` (MLA, ``models/deepseek_v2/geometry.py``): the value is the
+    key's latent dims, so the window stores the KEY codes and the key grid only
+    -- the latent is quantized once, per channel, as a key. At DeepSeek-V2-Lite's
+    ``H=1, D=576, ws=8`` that is 1152 + 1224 = 2376 B.
     """
+    if value_alias:
+        return num_kv_heads * ((head_dim * window_size) // 4
+                               + grid_bytes_per_head(head_dim))
     codes = (head_dim * window_size) // 2          # K and V, 2 bits per element
     return num_kv_heads * (codes + grid_bytes_per_head(head_dim)
                            + grid_bytes_per_head(window_size))
@@ -192,7 +207,7 @@ class QGrid(NamedTuple):
     Why one byte, and why grouped
     -----------------------------
     An fp16 grid was 48.5% of a window's codes-plus-grid. Narrowing it is nearly
-    free because design §2 pins the codes to the *stored* grid: a rounded scale
+    free because the codes are pinned to the *stored* grid: a rounded scale
     just repositions the four int2 levels and the codes re-fit against them, so
     the int2 error (~13% on keys) swamps the grid's rounding.
 

@@ -71,7 +71,7 @@ CALIBRATION = {
     "measured_alloc_peak_gb": 29.25,
     "measured_device_peak_gb": 35.67,
     "measured_end_alloc_gb": 16.00,
-    #: The SAME cell with L-reuse working (STICKYKV_LSE_BACKEND=flash). Differs
+    #: The SAME cell with L-reuse working (RECOVERKV_LSE_BACKEND=flash). Differs
     #: from the row above only by the compute_lse transient, which is what makes
     #: both that term and ``other`` solvable rather than fitted. Buffer sizing
     #: does not depend on gen length (cache.py:367), so the shorter generation
@@ -287,7 +287,7 @@ def predict_prefill_peak(
                                    chunk=max(chunk // 8, 1),
                                    noninplace_factor=noninplace_factor)
         notes.append(
-            f"STICKYKV_PREFILL_SCORE_CHUNK={max(chunk // 8, 1)} would cut that term "
+            f"RECOVERKV_PREFILL_SCORE_CHUNK={max(chunk // 8, 1)} would cut that term "
             f"to {smaller:.1f} GB (same FLOPs, more iterations, no logic change)")
     return MemoryBreakdown(
         weights=w, prefill_kv=kv, lse_recompute=lse, other=other,

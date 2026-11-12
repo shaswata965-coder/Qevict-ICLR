@@ -172,6 +172,46 @@ class HookHandles:
 # install_score_hooks
 # ---------------------------------------------------------------------------
 
+
+def _install_mla(model: nn.Module, cache: Any, handles: "HookHandles") -> "HookHandles":
+    """The DeepSeek-V2 branch of :func:`install_score_hooks`.
+
+    Requires the owned MLA forward (``models.deepseek_v2.loader``); a model
+    without it would attend through upstream code that slices RoPE by the held
+    length and caches the decompressed heads, so this raises instead.
+    """
+    from models.deepseek_v2.loader import attention_modules
+
+    mods = attention_modules(model)
+    if not all(hasattr(m, "_recoverkv_geometry") for m in mods):
+        raise RuntimeError(
+            "a deepseek_v2 model reached install_score_hooks without the owned "
+            "MLA attention forward. Load it through "
+            "models.deepseek_v2.loader.load_model / install_recoverkv_mla (or "
+            "utils.model_loading.load_causal_lm), which every runner uses.")
+    flash = bool(getattr(mods[0], "_recoverkv_flash", False))
+    cuda = torch.cuda.is_available()
+    fused = flash and cuda and fused_decode_enabled()
+    handles.fused_decode = fused
+    handles.lse_active = flash and cuda
+    handles.lse_label = "flash (owned MLA forward)" if handles.lse_active else "off"
+    if fused:
+        assert_prefill_kernel_available(True)
+        assert_decode_kernel_available(True)
+        setattr(cache, "_fused_decode_active", True)
+        for m in mods:
+            h = m.register_forward_pre_hook(lambda _m, _a: flash_decode.clear())
+            handles._hook_handles.append(h)
+    if not _PATH_ANNOUNCED[0]:
+        _PATH_ANNOUNCED[0] = True
+        print(
+            "[RecoverKV] score path: OWNED MLA forward (deepseek_v2) | prefill "
+            f"scoring -> {'Triton score kernel, L from flash' if flash and cuda else 'PyTorch softmax (CPU reference)'} | "
+            f"decode -> {describe_decode_backend(cuda) if fused else 'materialize (CPU reference)'}",
+            flush=True,
+        )
+    return handles
+
 # Guards the one-per-process "which scoring path" banner (install runs per
 # sample in the runners, so an unguarded print would spam thousands of lines).
 _PATH_ANNOUNCED = [False]
@@ -199,10 +239,9 @@ SCORE_SOFTMAX_DTYPE = torch.bfloat16
 #: step, typically well under 1e-2 per window. An fp16 addend below half an ULP
 #: of the running total rounds to no change: at a total of 64 that is anything
 #: under 0.03, so almost every decode step's evidence was discarded and each
-#: re-eviction ranked on the prompt alone. ``446a7eb`` measured the same loss on
-#: the July int2 branches (52% of per-step contributions gone in fp16, the kept
-#: set diverging ~9% over 512 steps) and fixed it on the Qwen branch only; it
-#: never reached this line. The cost is ``[B, H_q, W]`` fp32 per layer.
+#: re-eviction ranked on the prompt alone. The same loss was measured on
+#: earlier int2 versions (52% of per-step contributions gone in fp16, the kept
+#: set diverging ~9% over 512 steps). The cost is ``[B, H_q, W]`` fp32 per layer.
 SCORE_ACCUM_DTYPE = torch.float32
 
 
@@ -238,6 +277,15 @@ def install_score_hooks(
     """
     handles = HookHandles()
 
+    # DeepSeek-V2 (MLA): there is nothing to hook. Its attention forward is
+    # OWNED (models/deepseek_v2/attention.py, installed at load), and it writes
+    # the eviction scores itself, at exactly the point these hooks would --
+    # because its remote code imports `flash_attn_func` into its own namespace,
+    # so the seam below is never reached. What remains of this function's job
+    # is arming the fused decode on CUDA, with the same Triton-or-raise gates.
+    if getattr(getattr(model, "config", None), "model_type", None) == "deepseek_v2":
+        return _install_mla(model, cache, handles)
+
     # Committed to the Triton path? Choosing the flash backend on CUDA commits to
     # the Triton PREFILL score kernel unconditionally — compute_token_scores has
     # no PyTorch fallback at T > 1 — so every degrade-to-silence branch below
@@ -246,7 +294,7 @@ def install_score_hooks(
     # the Triton-or-error contract exists to make impossible.
     #
     # Note this is deliberately NOT gated on fused_decode_enabled(): turning the
-    # decode kernel off (STICKYKV_FUSED_DECODE=0) opts out of the *decode* kernel
+    # decode kernel off (RECOVERKV_FUSED_DECODE=0) opts out of the *decode* kernel
     # only, and prefill scoring still has to run on Triton.
     #
     # Off CUDA (CPU hook-install unit tests) the warn-and-degrade behaviour is
@@ -513,7 +561,7 @@ def install_score_hooks(
                 scaling = getattr(module, "scaling", head_dim ** -0.5)
 
                 # Reuse flash's softmax normaliser L when it was captured this
-                # forward (STICKYKV_SCORE_LSE_FROM_FORWARD + Triton backend). It
+                # forward (RECOVERKV_SCORE_LSE_FROM_FORWARD + Triton backend). It
                 # is only valid when the keys the score pass sees equal the keys
                 # flash saw: pure prefill (T > 1) with no post-eviction reorder
                 # (score_meta is None ⟹ k_current is the plain fp store). The
@@ -530,7 +578,7 @@ def install_score_hooks(
                         lse = cand.to(device=q.device)
                     else:
                         # ALWAYS raise. This was `elif _lse_strict()`, a knob
-                        # deleted in 0974687 whose call site stayed -- so an
+                        # since deleted whose call site stayed -- so an
                         # L-reuse miss raised NameError from inside the handler
                         # for it. The knob's "off" degraded to compute_lse, a
                         # second O(N^2) pass whose fp32 block is 32 GB at

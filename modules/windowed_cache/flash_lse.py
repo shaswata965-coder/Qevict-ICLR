@@ -115,11 +115,11 @@ def _make_wrapper(orig):
             if True:
                 raise RuntimeError(
                     "flash_attn_func rejected return_attn_probs, so L cannot be "
-                    "captured from the forward. STICKYKV_LSE_STRICT is on, so "
+                    "captured from the forward. RECOVERKV_LSE_STRICT is on, so "
                     "this is a hard error rather than a silent second O(N^2) "
                     "prefill pass (which also materialises the fp32 block that "
                     "OOMs 4096/batch-32). Either install a flash-attn build "
-                    "set STICKYKV_LSE_STRICT=0 to accept the recompute."
+                    "set RECOVERKV_LSE_STRICT=0 to accept the recompute."
                 ) from exc
             return orig(*args, **kwargs)
 

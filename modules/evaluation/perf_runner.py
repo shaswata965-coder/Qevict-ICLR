@@ -28,13 +28,13 @@ implementation we have actually read: ``evaluation/efficiency_evaluate.py`` in
 the DefensiveKV release (ICLR 2026), a fork of NVIDIA's kvpress, whose PRESS_DICT
 can drive SnapKV / AdaKV / CriticalKV / DefensiveKV. Note what that does and does
 not buy: the published papers do not document a protocol at this resolution (see
-``configs/eval_efficiency.yaml``), so matching it makes our numbers reproducible
+``configs/llama/eval_efficiency.yaml``), so matching it makes our numbers reproducible
 and comparable to a RE-RUN of a baseline, not automatically to a printed table —
 which is why ``cache_backend: external`` exists. Reproducing that reference
 implementation's *numbers* needs four things this runner would otherwise do
 differently, each now a knob on
 :class:`~utils.config.PerfConfig` (all defaulting to the historical behaviour,
-all flipped together by ``configs/eval_efficiency.yaml``):
+all flipped together by ``configs/llama/eval_efficiency.yaml``):
 
 * ``prompt_mode="repeat_sentence"`` — they prefill a tiled English sentence, not
   uniform random token ids. Random ids are out-of-distribution, and an eviction
@@ -330,7 +330,7 @@ def _reset_lse_recompute_count() -> None:
 def _lse_reuse_requested() -> bool:
     """Whether the run asked for L to come from the forward (the default)."""
     return os.environ.get(
-        "STICKYKV_SCORE_LSE_FROM_FORWARD", "1"
+        "RECOVERKV_SCORE_LSE_FROM_FORWARD", "1"
     ).strip().lower() in ("1", "true", "yes", "on")
 
 
@@ -342,7 +342,7 @@ def _lse_transient_gb(batch_size: int, model_config: Any, prefill_len: int) -> f
     length, so the term is quadratic in context and linear in batch.
     """
     try:
-        chunk = int(os.environ.get("STICKYKV_PREFILL_SCORE_CHUNK", "1024") or 1024)
+        chunk = int(os.environ.get("RECOVERKV_PREFILL_SCORE_CHUNK", "1024") or 1024)
     except (TypeError, ValueError):
         chunk = 1024
     h_q = int(getattr(model_config, "num_attention_heads", 0) or 0)
@@ -409,7 +409,7 @@ def _prefill_score_chunk_env() -> int:
     in total FLOPs.
     """
     try:
-        v = int(os.environ.get("STICKYKV_PREFILL_SCORE_CHUNK", "1024"))
+        v = int(os.environ.get("RECOVERKV_PREFILL_SCORE_CHUNK", "1024"))
         return v if v > 0 else 1024
     except (TypeError, ValueError):
         return 1024
@@ -491,6 +491,10 @@ def describe_tier_geometry(resolved, prefill_len: int) -> Dict[str, Any]:
         "top_k_fp": int(resolved.top_k_fp),
         "N_q": int(resolved.N_q),
         "quant_ratio": float(resolved.quant_ratio),
+        # The gate card's widths and what they cost -- a narrower card is a
+        # cheaper window, so N_q above already reflects them under "bytes".
+        "quant_card_bits": dict(resolved.quant_card_bits._asdict()),
+        "bytes_per_gate_card": int(resolved.bytes_per_gate_card),
         "fp_tokens": fp_tokens,
         "q_tokens": q_tokens,
         # The number of keys one decode step attends over — the quantity that
@@ -1128,11 +1132,11 @@ class PerfRunner:
             "## L-reuse state (the compute_lse transient is linear in B*S)",
             f"  compute_lse calls this process: {_lse_recompute_count()}",
             f"  flashinfer latch reason:        {_lse_broken_reason()}",
-            f"  STICKYKV_PREFILL_SCORE_CHUNK:   {_prefill_score_chunk_env()}",
+            f"  RECOVERKV_PREFILL_SCORE_CHUNK:   {_prefill_score_chunk_env()}",
             "",
             "## env knobs in effect",
         ]
-        for k in sorted(k for k in os.environ if k.startswith("STICKYKV_")):
+        for k in sorted(k for k in os.environ if k.startswith("RECOVERKV_")):
             lines.append(f"  {k}={os.environ[k]}")
         lines.append("")
 
@@ -1195,13 +1199,14 @@ class PerfRunner:
 
     def _measure_config(self, c: dict, prefill_len: int, gen_len: int, batch_size: int, pc, cfg) -> List[dict]:
         from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
+        from utils.model_loading import load_causal_lm, load_tokenizer
         dtypes = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}
         torch_dtype = dtypes.get(cfg.model.dtype, torch.float16)
         attn_impl = c.get("attn_implementation", "flash_attention_2")
-        tokenizer = AutoTokenizer.from_pretrained(cfg.model.name, revision=cfg.model.revision)
+        tokenizer = load_tokenizer(cfg.model.name, revision=cfg.model.revision)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
-        model = AutoModelForCausalLM.from_pretrained(
+        model = load_causal_lm(
             cfg.model.name, revision=cfg.model.revision,
             torch_dtype=torch_dtype, attn_implementation=attn_impl,
             device_map="auto")
@@ -1262,7 +1267,7 @@ class PerfRunner:
             # here with setdefault semantics so an explicit env — including a
             # deliberate "0" — always wins.
             #
-            # STICKYKV_COMPILE_EVICT is the one that matters. Decode at these
+            # RECOVERKV_COMPILE_EVICT is the one that matters. Decode at these
             # shapes is bound by DISPATCH COUNT, not by the kernels the dispatches
             # feed: TPOT is flat to within 4% across a 32x change in batch size and
             # a 4.2x change in effective sequence length, which only happens when
@@ -1280,16 +1285,16 @@ class PerfRunner:
             # measured the uncompiled eviction. Verify it with the dynamo counters and
             # evict_path_stats() below rather than trusting the flag.
             #
-            # STICKYKV_COMPILE_READ used to be set here too, on the reasoning
+            # RECOVERKV_COMPILE_READ used to be set here too, on the reasoning
             # that it was "still the fast path whenever the fused kernel is off
-            # (STICKYKV_FUSED_DECODE=0, or an empty Q tier)". Neither case
+            # (RECOVERKV_FUSED_DECODE=0, or an empty Q tier)". Neither case
             # survives: the fused kernel can no longer be turned off, and on an
             # empty Q tier effective_q_tier returns None before reaching the read
             # chain. It was setting a flag that selected nothing and printing a
             # banner naming a read path the run was not taking, so the flag and
             # its fork are gone (modules/quant/effective.py).
-            # STICKYKV_COMPILE_EVICT is NOT set here any more. The eviction has
-            # been compiled unconditionally since 0974687 and `cache.py` reads no
+            # RECOVERKV_COMPILE_EVICT is NOT set here any more. The eviction has
+            # been compiled unconditionally for a while and `cache.py` reads no
             # environment variable at all, so setting it selected nothing while
             # leaving a variable in the run's environment that a reader would
             # reasonably take for a control arm. A knob that records intent but
@@ -1344,7 +1349,12 @@ class PerfRunner:
                       # through the factory.
                       **quant_gate_ratio_kwargs(
                           WCC, c.get("quant_gate_ratio",
-                                     getattr(cfg.cache, "quant_gate_ratio", 0.25))))
+                                     getattr(cfg.cache, "quant_gate_ratio", 0.25))),
+                      # Gate-card field widths, per-config override like the
+                      # ratio above; None means the shipped card.
+                      quant_card_bits=c.get(
+                          "quant_card_bits",
+                          getattr(cfg.cache, "quant_card_bits", None)))
             # Two-pass RoPE discovery (mirrors ours_parity_runner.py).
             for nm, mod in model.named_modules():
                 if "rotary" in nm.lower() or "rope" in nm.lower():
@@ -1591,7 +1601,7 @@ class PerfRunner:
                 # to the method, and neither is distinguishable from a real result
                 # in the recorded numbers.
                 #
-                # Escape hatch is the documented one: STICKYKV_SCORE_LSE_FROM_FORWARD=0
+                # Escape hatch is the documented one: RECOVERKV_SCORE_LSE_FROM_FORWARD=0
                 # says "measure the recompute path on purpose", and then this is
                 # silent.
                 lse_misses = _lse_recompute_count()
@@ -1657,15 +1667,15 @@ class PerfRunner:
                         from utils.config import ConfigValidationError
                         raise ConfigValidationError(
                             detail + " Refusing to report a TTFT/max-B that belong "
-                            "to the recompute path. Set STICKYKV_LSE_STRICT=0 to keep "
+                            "to the recompute path. Set RECOVERKV_LSE_STRICT=0 to keep "
                             "the cell on the recompute path (TTFT flagged in "
                             "provenance; decode columns are unaffected), or "
-                            "STICKYKV_SCORE_LSE_FROM_FORWARD=0 to stop requesting "
+                            "RECOVERKV_SCORE_LSE_FROM_FORWARD=0 to stop requesting "
                             "L-reuse entirely, or install a working flashinfer/"
                             "flash-attn L source."
                         )
                     log.warning(
-                        "%s STICKYKV_LSE_STRICT=0: keeping the cell on the recompute "
+                        "%s RECOVERKV_LSE_STRICT=0: keeping the cell on the recompute "
                         "path. TTFT is recompute-path (flagged in provenance as "
                         "L=... RECOMPUTED); TPOT / throughput / memory are unaffected.",
                         detail)
@@ -1815,7 +1825,7 @@ class PerfRunner:
         # -- did the compiled eviction actually fuse? ------------------------
         # Two separate questions, and the flag answers neither. (1) Did the
         # compiled body RUN — evict_path_stats splits evictions by path, and any
-        # `uncompiled` count on a run that set STICKYKV_COMPILE_EVICT means the
+        # `uncompiled` count on a run that set RECOVERKV_COMPILE_EVICT means the
         # dispatch we were trying to remove is still being paid. (2) Did it fuse
         # or just trace — torch.compile responds to a graph break by splitting
         # the region and running the pieces uncompiled, silently, so a "compiled"
@@ -1854,7 +1864,7 @@ class PerfRunner:
             diag["eviction"] = {"path_stats": ev, "dynamo_counters": dyn,
                                 "compile_failed": compile_failed}
             log.info("eviction path: %s | dynamo: %s", ev or "n/a", dyn or "n/a")
-            compile_on = os.environ.get("STICKYKV_COMPILE_EVICT", "0").strip().lower() in (
+            compile_on = os.environ.get("RECOVERKV_COMPILE_EVICT", "0").strip().lower() in (
                 "1", "true", "yes", "on")
             if compile_failed:
                 # The compiled eviction is kernel-or-error (cache.py): it raised
@@ -1865,11 +1875,11 @@ class PerfRunner:
                     "config %s: torch.compile could NOT lower the eviction on this "
                     "build (%s). Kernel-or-error: the cell ERRORED rather than "
                     "running uncompiled under a compiled label. Fix the lowering or run "
-                    "with STICKYKV_COMPILE_EVICT=0 for uncompiled numbers.",
+                    "with RECOVERKV_COMPILE_EVICT=0 for uncompiled numbers.",
                     c.get("name"), compile_failed)
             elif compile_on and ev.get("uncompiled"):
                 log.warning(
-                    "config %s: STICKYKV_COMPILE_EVICT is on but %d eviction(s) "
+                    "config %s: RECOVERKV_COMPILE_EVICT is on but %d eviction(s) "
                     "still ran the UNCOMPILED body (compiled: %d). Those steps paid the "
                     "full ~273-launch-per-layer eviction this flag exists to "
                     "remove.", c.get("name"), ev["uncompiled"], ev.get("compiled", 0))
